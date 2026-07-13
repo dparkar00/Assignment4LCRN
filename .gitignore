@@ -1,0 +1,14 @@
+HMDB51/
+*.jpg
+*.jpeg
+*.png
+models/
+*.pt
+*.pth
+splits.npy
+wandb/
+__pycache__/
+*.pyc
+venv/
+.DS_Store
+EOF
