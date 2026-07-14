@@ -146,51 +146,64 @@ def compose_data_transforms(height, width, mean, std):
     return train_transforms, val_test_transforms
 
 
-def train_val_dloaders(train_dataset, val_dataset, batch_size, model='lrcn'):
+def train_val_dloaders(train_dataset, val_dataset, batch_size, model='lrcn', num_workers=2):
     """
     Create DataLoaders for training and validation datasets.
-
+ 
     Selects the appropriate collate function based on the model type.
     For 'lrcn' (RNN-based models), uses collate_fn_rnn which pads sequences to equal lengths.
     Otherwise, uses collate_fn_r3d_18 for 3D CNN models.
-
+ 
+    PERFORMANCE FIX: the original DataLoaders used the default num_workers=0, meaning
+    every frame image is opened and transformed on the main process, blocking the GPU
+    from getting new batches while it waits on disk/Drive I/O. Setting num_workers > 0
+    lets multiple worker processes prefetch and transform frames in parallel with GPU
+    compute; pin_memory speeds up the host-to-GPU transfer for CUDA devices.
+ 
     Args:
         train_dataset (Dataset): PyTorch Dataset for training data.
         val_dataset (Dataset): PyTorch Dataset for validation data.
         batch_size (int): Number of samples per batch.
         model (str): Model type; 'lrcn' for RNN-based models, otherwise for 3D CNNs.
-
+        num_workers (int): Number of subprocesses used for data loading.
+ 
     Returns:
         dict: Dictionary with keys 'train' and 'val' mapping to their respective DataLoaders.
     """
     collate = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
     train_dl = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate,
+        num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
     )
     val_dl = DataLoader(
-        val_dataset, batch_size=2 * batch_size, shuffle=False, collate_fn=collate
+        val_dataset, batch_size=2 * batch_size, shuffle=False, collate_fn=collate,
+        num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
     )
     return {"train": train_dl, "val": val_dl}
 
-
-def test_dloaders(test_dataset, batch_size, model='lrcn'):
+def test_dloaders(test_dataset, batch_size, model='lrcn', num_workers=2):
     """
     Create a DataLoader for the test dataset.
-
+ 
     Selects the appropriate collate function based on the model type.
     For 'lrcn' models, uses collate_fn_rnn; otherwise, uses collate_fn_r3d_18.
-
+ 
+    PERFORMANCE FIX: see train_val_dloaders -- num_workers/pin_memory added so test
+    evaluation isn't bottlenecked on single-process frame I/O either.
+ 
     Args:
         test_dataset (Dataset): PyTorch Dataset for test data.
         batch_size (int): Number of samples per batch.
         model (str): Model type; 'lrcn' for RNN-based models, otherwise for 3D CNNs.
-
+        num_workers (int): Number of subprocesses used for data loading.
+ 
     Returns:
         dict: Dictionary with key 'test' mapping to the test DataLoader.
     """
     collate = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
     test_dl = DataLoader(
-        test_dataset, batch_size=2 * batch_size, shuffle=False, collate_fn=collate
+        test_dataset, batch_size=2 * batch_size, shuffle=False, collate_fn=collate,
+        num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
     )
     return {"test": test_dl}
 
