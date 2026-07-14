@@ -38,7 +38,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import wandb
 
-from models import LRCN
+from models import LRCN, R3DClassifier
 # NOTE: this project's own test.py module shares its name with Python's stdlib
 # "test" package, which is what triggers pylint's import-order warning below for
 # these two lines; the imports still resolve correctly to the local module.
@@ -143,6 +143,13 @@ def args_parser():
     parser.add_argument("-bs", "--batch_size", type=int, required=True, help="Mini-batch size")
     parser.add_argument("-d", "--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("-lr", "--learning_rate", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument(
+        "-blrf", "--backbone_lr_factor", type=float, default=1.0,
+        help="Multiplier applied to --learning_rate for backbone (CNN) parameters "
+             "only, e.g. 0.1 gives the backbone 1/10th the LR of the newly "
+             "initialized head (model improvement -- prevents an LR tuned for "
+             "fresh layers from being too aggressive for pretrained weights)",
+    )
     parser.add_argument("-ne", "--n_epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument(
         "-lrp", "--lr_patience", type=int, default=5,
@@ -212,15 +219,26 @@ def main(args):
     tr_transforms, val_ts_transforms = compose_data_transforms(h, w, mean, std)
 
     # Initialize the model (LRCN)
-    model = LRCN(
-        hidden_size=rnn_hidden_size, n_layers=rnn_n_layers, dropout_rate=dropout,
-        n_classes=n_classes, pretrained=pretrained, cnn_model=cnn_backbone,
-        freeze_backbone_until=args.freeze_backbone_until,
-        bidirectional=args.bidirectional,
-        use_attention=args.use_attention,
-        use_conv_lstm=args.use_conv_lstm,
-        conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
-    )
+    # FIX: --model_type was documented and accepted as a CLI arg (including a
+    # '3dcnn' option) but never actually used to select which model gets built --
+    # LRCN was constructed unconditionally regardless of --model_type. Model
+    # improvement: R3DClassifier (Kinetics-400-pretrained 3D CNN) is now wired up
+    # as a real alternative when --model_type 3dcnn is passed.
+    if model_type == '3dcnn':
+        model = R3DClassifier(
+            n_classes=n_classes, pretrained=pretrained,
+            freeze_backbone_until=args.freeze_backbone_until,
+        )
+    else:
+        model = LRCN(
+            hidden_size=rnn_hidden_size, n_layers=rnn_n_layers, dropout_rate=dropout,
+            n_classes=n_classes, pretrained=pretrained, cnn_model=cnn_backbone,
+            freeze_backbone_until=args.freeze_backbone_until,
+            bidirectional=args.bidirectional,
+            use_attention=args.use_attention,
+            use_conv_lstm=args.use_conv_lstm,
+            conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
+        )
 
     if mode == 'train':
         # FIX: load_dataset/dataset_split now return group keys derived from
@@ -249,7 +267,31 @@ def main(args):
         # becoming overconfident on training examples it has memorized.
         loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
         # Model improvement: weight decay for regularization.
-        opt = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        # Model improvement: differential learning rates. A backbone_lr_factor < 1.0
+        # gives the pretrained CNN backbone a lower LR than the freshly-initialized
+        # head (LSTM/ConvLSTM/attention/fc), preventing an LR tuned for the fresh
+        # layers from being too aggressive for already-good pretrained weights.
+        # NOTE: when use_conv_lstm=True, model.spatial_extractor and model.base_model
+        # reference the *same* underlying parameter tensors (both wrap the backbone's
+        # conv layers), so parameters are deduped by identity to avoid the same
+        # tensor being assigned to two optimizer param groups at once.
+        backbone_param_ids = {id(p) for p in model.base_model.parameters()}
+        seen_ids, backbone_params, head_params = set(), [], []
+        for param in model.parameters():
+            if not param.requires_grad or id(param) in seen_ids:
+                continue
+            seen_ids.add(id(param))
+            if id(param) in backbone_param_ids:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+        opt = optim.Adam(
+            [
+                {"params": backbone_params, "lr": learning_rate * args.backbone_lr_factor},
+                {"params": head_params, "lr": learning_rate},
+            ],
+            weight_decay=1e-4,
+        )
         # FIX: verbose=1 is invalid/deprecated for ReduceLROnPlateau in recent
         # PyTorch versions (expects bool, and is removed entirely in newest versions).
         lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=args.lr_patience)

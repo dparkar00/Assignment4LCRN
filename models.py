@@ -319,3 +319,66 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods,too-many-instan
         # Pass the final output through the fully-connected layer to get class logits.
         out = self.fc(out)
         return out
+
+
+class R3DClassifier(nn.Module):  # pylint: disable=too-few-public-methods
+    """
+    Model improvement: a 3D CNN video classifier (R3D-18), pretrained on
+    Kinetics-400, used as an alternative to the LRCN's 2D-CNN-plus-RNN approach.
+
+    Unlike LRCN, which extracts per-frame appearance features and only models
+    temporal dynamics afterward via a separate recurrent unit, a 3D CNN applies
+    3D convolutions across space AND time jointly from the very first layer, so
+    it directly represents motion rather than inferring it indirectly from a
+    sequence of independent per-frame feature vectors. Kinetics-400 pretraining
+    also means the backbone starts already familiar with action/motion patterns,
+    rather than only static ImageNet object categories.
+
+    Uses video_datasets.collate_fn_r3d_18 and utils.transform_stats('3dcnn'),
+    both of which already existed in this codebase but were never wired up to
+    an actual 3D CNN model.
+
+    Args:
+        n_classes (int): Number of output classes.
+        pretrained (bool, optional): Use Kinetics-400 pretrained weights. Default True.
+        freeze_backbone_until (int, optional): If set, freezes all backbone parameters
+            except the last N children modules, matching LRCN's partial-freezing option.
+    """
+    def __init__(self, n_classes, pretrained=True, freeze_backbone_until=None):
+        super().__init__()
+        weights = models.video.R3D_18_Weights.KINETICS400_V1 if pretrained else None
+        base_cnn = models.video.r3d_18(weights=weights)
+
+        num_features = base_cnn.fc.in_features
+        base_cnn.fc = Identity()
+        self.base_model = base_cnn
+
+        if freeze_backbone_until is not None:
+            children = [c for c in self.base_model.children()
+                        if any(True for _ in c.parameters())]
+            n_freeze = max(0, len(children) - freeze_backbone_until)
+            for child in children[:n_freeze]:
+                for param in child.parameters():
+                    param.requires_grad = False
+
+        self.fc = nn.Linear(num_features, n_classes)
+
+    def forward(self, x, lengths=None):  # pylint: disable=unused-argument
+        """
+        Args:
+            x (Tensor): Input of shape (batch_size, channels, time_steps, height,
+                width) -- note channel-first-then-time, matching
+                video_datasets.collate_fn_r3d_18's output layout, which differs
+                from LRCN's (batch, time_steps, channels, height, width).
+            lengths: Unused. Accepted only so train.py/test.py can call
+                model(x, lengths=lengths) the same way for both LRCN and
+                R3DClassifier without model-type-specific branching. R3D-18 has
+                no notion of variable-length/padded sequences the way the LSTM
+                path does.
+
+        Returns:
+            Tensor: Class logits of shape (batch_size, n_classes).
+        """
+        feats = self.base_model(x)
+        out = self.fc(feats)
+        return out

@@ -51,7 +51,7 @@ import wandb
 
 from video_datasets import VideoDataset, load_dataset, dataset_split
 from utils import transform_stats, compose_data_transforms, compose_dataloaders
-from models import LRCN
+from models import LRCN, R3DClassifier
 from train import train
 
 def str2bool(value):
@@ -149,6 +149,13 @@ def args_parser():
         "-d", "--dropout", type=float, default=0.1, help="Dropout rate for regularization"
     )
     parser.add_argument("-lr", "--learning_rate", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument(
+        "-blrf", "--backbone_lr_factor", type=float, default=1.0,
+        help="Multiplier applied to --learning_rate for backbone (CNN) parameters "
+             "only, e.g. 0.1 gives the backbone 1/10th the LR of the newly "
+             "initialized head (model improvement -- prevents an LR tuned for "
+             "fresh layers from being too aggressive for pretrained weights)",
+    )
     parser.add_argument("-ne", "--n_epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument(
         "-lrp", "--lr_patience", type=int, default=5,
@@ -225,19 +232,30 @@ def trainer(args):
     dataloaders = compose_dataloaders(tr_dataset, val_dataset, ts_dataset, batch_size, model_type)
 
     # Initialize the LRCN model with the specified parameters
-    model = LRCN(
-        hidden_size=rnn_hidden_size,
-        n_layers=rnn_n_layers,
-        dropout_rate=dropout,
-        n_classes=n_classes,
-        pretrained=pretrained,
-        cnn_model=cnn_backbone,
-        freeze_backbone_until=args.freeze_backbone_until,
-        bidirectional=args.bidirectional,
-        use_attention=args.use_attention,
-        use_conv_lstm=args.use_conv_lstm,
-        conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
-    )
+    # FIX: --model_type was documented and accepted as a CLI arg (including a
+    # '3dcnn' option) but never actually used to select which model gets built --
+    # LRCN was constructed unconditionally regardless of --model_type. Model
+    # improvement: R3DClassifier (Kinetics-400-pretrained 3D CNN) is now wired up
+    # as a real alternative when --model_type 3dcnn is passed.
+    if model_type == '3dcnn':
+        model = R3DClassifier(
+            n_classes=n_classes, pretrained=pretrained,
+            freeze_backbone_until=args.freeze_backbone_until,
+        )
+    else:
+        model = LRCN(
+            hidden_size=rnn_hidden_size,
+            n_layers=rnn_n_layers,
+            dropout_rate=dropout,
+            n_classes=n_classes,
+            pretrained=pretrained,
+            cnn_model=cnn_backbone,
+            freeze_backbone_until=args.freeze_backbone_until,
+            bidirectional=args.bidirectional,
+            use_attention=args.use_attention,
+            use_conv_lstm=args.use_conv_lstm,
+            conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
+        )
     model = model.to(device)
 
     # Define the loss function, optimizer, and learning rate scheduler
@@ -245,7 +263,24 @@ def trainer(args):
     # of a hard one-hot target), discouraging the model from becoming
     # overconfident on training examples it has memorized.
     loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
-    opt = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    # Model improvement: differential learning rates -- see run.py for full rationale.
+    backbone_param_ids = {id(p) for p in model.base_model.parameters()}
+    seen_ids, backbone_params, head_params = set(), [], []
+    for param in model.parameters():
+        if not param.requires_grad or id(param) in seen_ids:
+            continue
+        seen_ids.add(id(param))
+        if id(param) in backbone_param_ids:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+    opt = optim.Adam(
+        [
+            {"params": backbone_params, "lr": learning_rate * args.backbone_lr_factor},
+            {"params": head_params, "lr": learning_rate},
+        ],
+        weight_decay=1e-4,
+    )
     lr_scheduler = ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=args.lr_patience)
     os.makedirs("./models", exist_ok=True)
     optim_model_dir = './models'

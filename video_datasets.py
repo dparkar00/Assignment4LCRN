@@ -191,9 +191,13 @@ def collate_fn_r3d_18(batch):
         batch (list): List of samples, each as (video_frames, label).
 
     Returns:
-        tuple: (imgs_tensor, labels_tensor)
+        tuple: (imgs_tensor, labels_tensor, lengths)
             - imgs_tensor (Tensor): Stacked video frames tensor with shape adjusted for R3D-18.
             - labels_tensor (Tensor): Tensor of labels.
+            - lengths: Always None -- R3D-18 takes a fixed-length clip directly and has
+                no notion of padded/variable-length sequences the way the LSTM path
+                does, but this keeps the same 3-tuple interface as collate_fn_rnn so
+                the training/eval loops don't need model-type-specific unpacking.
     """
     imgs_batch, label_batch = list(zip(*batch))
     imgs_batch = [imgs for imgs in imgs_batch if len(imgs) > 0]
@@ -201,7 +205,7 @@ def collate_fn_r3d_18(batch):
     imgs_tensor = torch.stack(imgs_batch)
     imgs_tensor = torch.transpose(imgs_tensor, 2, 1)
     labels_tensor = torch.stack(label_batch)
-    return imgs_tensor, labels_tensor
+    return imgs_tensor, labels_tensor, None
 
 
 def collate_fn_rnn(batch):
