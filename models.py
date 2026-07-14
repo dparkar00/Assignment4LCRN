@@ -16,7 +16,7 @@ Classes:
 import torch
 from torch import nn
 
-from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torchvision import models
 
 class Identity(nn.Module):  # pylint: disable=too-few-public-methods
@@ -74,6 +74,10 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
             except the last N children modules, for cheaper/more stable fine-tuning
             (model-level improvement).
         bidirectional (bool, optional): Use a bidirectional LSTM (model-level improvement).
+        use_attention (bool, optional): Model improvement -- instead of using only the
+            LSTM's final hidden state, learn an attention weight over every timestep's
+            output and pool them into a weighted context vector. Useful when the most
+            discriminative motion in a clip doesn't occur at the very last frame.
 
     Raises:
         ValueError: If the specified cnn_model is not supported.
@@ -89,6 +93,7 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
         cnn_model="resnet34",
         freeze_backbone_until=None,
         bidirectional=False,
+        use_attention=False,
     ):
         super().__init__()
 
@@ -127,6 +132,12 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
         # A bidirectional LSTM concatenates its forward and backward final hidden
         # states, doubling the feature width that reaches the classifier head.
         rnn_out_size = hidden_size * (2 if bidirectional else 1)
+        # Model improvement: optional attention pooling over LSTM timestep outputs,
+        # instead of relying only on the final hidden state (see forward()).
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = nn.Linear(rnn_out_size, 1)
+
         # Define dropout for regularization.
         self.dropout = nn.Dropout(dropout_rate)
         # Final fully-connected layer to produce logits for each class.
@@ -168,13 +179,29 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
             packed = pack_padded_sequence(
                 feats, lengths.cpu(), batch_first=True, enforce_sorted=False
             )
-            _packed_out, (hn, _cn) = self.rnn(packed)
+            packed_out, (hn, _cn) = self.rnn(packed)
+            # Recover per-timestep outputs (needed for attention pooling below).
+            # Padded timesteps come back as zeros and are masked out explicitly.
+            rnn_out, out_lengths = pad_packed_sequence(packed_out, batch_first=True)
         else:
-            _out, (hn, _cn) = self.rnn(feats)
+            rnn_out, (hn, _cn) = self.rnn(feats)
+            out_lengths = torch.full((bs,), ts, dtype=torch.long, device=x.device)
 
-        # hn shape: (num_layers * num_directions, batch, hidden_size).
-        # Take the last layer's hidden state(s).
-        if self.rnn.bidirectional:
+        if self.use_attention:
+            # Model improvement: attention pooling. Score every timestep's LSTM
+            # output, mask out padded positions so they can never receive weight,
+            # softmax over time, then take the weighted sum as the context vector
+            # -- lets the model emphasize whichever frames are most discriminative
+            # instead of always trusting only the final timestep.
+            attn_scores = self.attention(rnn_out).squeeze(-1)  # (batch, seq)
+            time_idx = torch.arange(rnn_out.size(1), device=rnn_out.device)
+            mask = time_idx[None, :] < out_lengths.to(rnn_out.device)[:, None]
+            attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+            attn_weights = torch.softmax(attn_scores, dim=1)
+            last_hidden = torch.sum(rnn_out * attn_weights.unsqueeze(-1), dim=1)
+        elif self.rnn.bidirectional:
+            # hn shape: (num_layers * num_directions, batch, hidden_size).
+            # Take the last layer's hidden state(s).
             last_hidden = torch.cat([hn[-2], hn[-1]], dim=1)
         else:
             last_hidden = hn[-1]

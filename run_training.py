@@ -35,6 +35,11 @@ Arguments include:
     -ne/--n_epochs: Number of training epochs (default: 30).
 """
 
+# pylint: disable=duplicate-code
+# run.py and run_training.py intentionally share a similar argparse setup
+# (two working entry points, per project requirements); the overlap is
+# expected, not an accidental duplication bug.
+
 import os
 import argparse
 
@@ -115,6 +120,11 @@ def args_parser():
     parser.add_argument(
         "-bi", "--bidirectional", type=str2bool, default=False,
         help="Use a bidirectional LSTM (model improvement)",
+    )
+    parser.add_argument(
+        "-att", "--use_attention", type=str2bool, default=False,
+        help="Use attention pooling over LSTM timestep outputs instead of only the "
+             "final hidden state (model improvement)",
     )
     parser.add_argument(
         "-fbu", "--freeze_backbone_until", type=int, default=None,
@@ -212,11 +222,15 @@ def trainer(args):
         cnn_model=cnn_backbone,
         freeze_backbone_until=args.freeze_backbone_until,
         bidirectional=args.bidirectional,
+        use_attention=args.use_attention,
     )
     model = model.to(device)
 
     # Define the loss function, optimizer, and learning rate scheduler
-    loss_func = nn.CrossEntropyLoss(reduction='sum')
+    # Model improvement: label smoothing softens the target distribution (instead
+    # of a hard one-hot target), discouraging the model from becoming
+    # overconfident on training examples it has memorized.
+    loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
     opt = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     lr_scheduler = ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=args.lr_patience)
     os.makedirs("./models", exist_ok=True)
