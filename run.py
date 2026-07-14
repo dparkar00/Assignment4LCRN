@@ -122,6 +122,11 @@ def args_parser():
     parser.add_argument("-d", "--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("-lr", "--learning_rate", type=float, default=3e-5, help="Learning rate")
     parser.add_argument("-ne", "--n_epochs", type=int, default=30, help="Number of training epochs")
+    parser.add_argument(
+        "-lrp", "--lr_patience", type=int, default=5,
+        help="Epochs with no val loss improvement before the LR scheduler reduces "
+             "the learning rate (ReduceLROnPlateau patience)",
+    )
 
     parser.add_argument(
         "-wb", "--wandb_project", type=str, default="hmdb51-lrcn", help="W&B project name"
@@ -219,7 +224,7 @@ def main(args):
         opt = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         # FIX: verbose=1 is invalid/deprecated for ReduceLROnPlateau in recent
         # PyTorch versions (expects bool, and is removed entirely in newest versions).
-        lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
+        lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=args.lr_patience)
         os.makedirs("./models", exist_ok=True)
         optim_model_dir = './models'
 

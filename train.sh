@@ -1,11 +1,13 @@
 #!/bin/bash
 # Log in once per machine with: wandb login
 #
-# TUNED: defaults below were adjusted after a 2-epoch smoke test showed loss
-# dropping too slowly to reach a strong accuracy within a realistic training
-# budget. learning_rate raised from 3e-5 -> 1e-4, freeze_backbone_until raised
-# from 2 -> 4 (lets more of the backbone adapt), batch_size raised from 4 -> 8
-# (better GPU utilization + more stable gradients), n_epochs raised to 35.
+# TUNED: learning_rate raised from 3e-5 -> 1e-4, freeze_backbone_until raised
+# from 2 -> 4, batch_size raised from 4 -> 8, n_epochs raised to 35 (see prior
+# smoke tests). A 5-epoch check at these settings showed val loss plateauing
+# by epoch 2-3 while train loss kept dropping (train 3.11->1.15, val
+# 2.65->2.06) -- an early overfitting signature. Countered with higher dropout
+# (0.1 -> 0.4) and a lower LR scheduler patience (5 -> 3) so the LR backs off
+# sooner once val loss stalls, instead of continuing to overfit at a fixed LR.
 python run.py \
     --frame_dir HMDB51 \
     --train_size 0.75 \
@@ -17,7 +19,9 @@ python run.py \
     --mode train \
     --n_epochs 35 \
     --learning_rate 1e-4 \
+    --dropout 0.4 \
+    --lr_patience 3 \
     --bidirectional True \
     --freeze_backbone_until 4 \
     --wandb_project hmdb51-lrcn \
-    --run_name lrcn-tuned-run1
+    --run_name lrcn-tuned-run2
