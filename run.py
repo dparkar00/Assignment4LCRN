@@ -120,6 +120,18 @@ def args_parser():
              "final hidden state (model improvement)",
     )
     parser.add_argument(
+        "-cls", "--use_conv_lstm", type=str2bool, default=False,
+        help="Replace the standard LSTM with a ConvLSTM operating directly on CNN "
+             "spatial feature maps, weaving recurrence throughout the model instead "
+             "of applying it only after full pooling (model improvement). Mutually "
+             "exclusive with --bidirectional/--use_attention.",
+    )
+    parser.add_argument(
+        "-clsh", "--conv_lstm_hidden_channels", type=int, default=128,
+        help="Number of hidden channels in the ConvLSTM cell (only used with "
+             "--use_conv_lstm)",
+    )
+    parser.add_argument(
         "-fbu", "--freeze_backbone_until", type=int, default=None,
         help="Number of trailing ResNet child modules to keep trainable; earlier "
              "layers are frozen (model improvement, partial fine-tuning)",
@@ -206,6 +218,8 @@ def main(args):
         freeze_backbone_until=args.freeze_backbone_until,
         bidirectional=args.bidirectional,
         use_attention=args.use_attention,
+        use_conv_lstm=args.use_conv_lstm,
+        conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
     )
 
     if mode == 'train':

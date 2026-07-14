@@ -65,7 +65,16 @@ class VideoDataset(Dataset):
         fr_paths = fr_paths[:self.fpv]
 
         # Open images using PIL
-        fr_imgs = [Image.open(fr_path) for fr_path in fr_paths]
+        # ROBUSTNESS FIX: a single corrupted/truncated JPEG (e.g. from an interrupted
+        # download or unzip) previously crashed the entire DataLoader worker and
+        # killed the whole training run with PIL.UnidentifiedImageError. Now a bad
+        # frame is skipped and logged instead of taking down the run.
+        fr_imgs = []
+        for fr_path in fr_paths:
+            try:
+                fr_imgs.append(Image.open(fr_path).convert("RGB"))
+            except (OSError, ValueError) as exc:
+                print(f"Skipping unreadable frame: {fr_path} ({exc})")
 
         # Get the label associated with the video
         fr_label = self.dataset[idx][1]

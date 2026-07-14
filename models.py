@@ -51,7 +51,59 @@ _BACKBONES = {
     "resnet152": models.resnet152,
 }
 
-class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
+class ConvLSTMCell(nn.Module):
+    """
+    Model improvement: a single ConvLSTM cell (Shi et al., 2015).
+
+    A standard LSTM's gates are fully-connected, so it can only operate on flat
+    feature vectors -- which means the CNN backbone must fully collapse each
+    frame's spatial structure (via global average pooling) *before* any temporal
+    modeling happens, and the LSTM only ever sees a sequence of already-pooled
+    vectors "tacked on" after the CNN.
+
+    ConvLSTM replaces the fully-connected gates with convolutions, so it can
+    operate directly on (C, H, W) spatial feature maps. This lets recurrence be
+    woven directly into the spatial feature representation at every timestep,
+    instead of being applied only after the CNN has already discarded spatial
+    structure via pooling.
+    """
+    def __init__(self, input_channels, hidden_channels, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        # A single convolution produces all four gates (input, forget, output,
+        # candidate) at once, taking the concatenation of the current input map
+        # and the previous hidden state map as its input.
+        self.conv = nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+        self.hidden_channels = hidden_channels
+
+    def forward(self, x_t, h_prev, c_prev):
+        """
+        Args:
+            x_t (Tensor): Input feature map for the current timestep, (B, C_in, H, W).
+            h_prev (Tensor): Previous hidden state map, (B, C_hidden, H, W).
+            c_prev (Tensor): Previous cell state map, (B, C_hidden, H, W).
+
+        Returns:
+            tuple: (h_t, c_t), the updated hidden and cell state maps.
+        """
+        combined = torch.cat([x_t, h_prev], dim=1)
+        gates = self.conv(combined)
+        in_gate, forget_gate, out_gate, cand_gate = torch.chunk(gates, 4, dim=1)
+        in_gate = torch.sigmoid(in_gate)
+        forget_gate = torch.sigmoid(forget_gate)
+        out_gate = torch.sigmoid(out_gate)
+        cand_gate = torch.tanh(cand_gate)
+
+        c_t = forget_gate * c_prev + in_gate * cand_gate
+        h_t = out_gate * torch.tanh(c_t)
+        return h_t, c_t
+
+class LRCN(nn.Module):  # pylint: disable=too-few-public-methods,too-many-instance-attributes
     """
     LRCN (Long-term Recurrent Convolutional Network) for video classification.
 
@@ -78,6 +130,14 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
             LSTM's final hidden state, learn an attention weight over every timestep's
             output and pool them into a weighted context vector. Useful when the most
             discriminative motion in a clip doesn't occur at the very last frame.
+        use_conv_lstm (bool, optional): Model improvement -- replace the standard
+            fully-connected LSTM (applied only after full spatial pooling) with a
+            ConvLSTM that operates directly on the CNN's spatial feature maps at
+            every timestep, weaving recurrence throughout the model instead of
+            tacking it on at the end. Mutually exclusive with bidirectional/
+            use_attention, which apply to the standard LSTM path.
+        conv_lstm_hidden_channels (int, optional): Number of hidden channels in the
+            ConvLSTM cell, used only when use_conv_lstm=True. Default is 128.
 
     Raises:
         ValueError: If the specified cnn_model is not supported.
@@ -94,6 +154,8 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
         freeze_backbone_until=None,
         bidirectional=False,
         use_attention=False,
+        use_conv_lstm=False,
+        conv_lstm_hidden_channels=128,
     ):
         super().__init__()
 
@@ -111,40 +173,65 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
         base_cnn.fc = Identity()
         self.base_model = base_cnn
 
+        # Model improvement: use_conv_lstm needs the CNN's raw spatial feature maps
+        # (C, H, W), not the fully pooled+flattened vector base_model produces. Build
+        # a second view of the backbone that stops right before its own internal
+        # average pool, so both paths below can share the same underlying weights.
+        self.use_conv_lstm = use_conv_lstm
+        if use_conv_lstm:
+            # All backbone children except the final adaptive avg pool and fc layer.
+            self.spatial_extractor = nn.Sequential(*list(base_cnn.children())[:-2])
+
         # Model improvement: optional partial backbone freezing for more stable,
         # cheaper fine-tuning on a modest-sized dataset.
+        # BUG FIX: children() includes parameterless modules (avgpool, the Identity
+        # fc replacement, etc.). Counting those toward "last N children" meant
+        # freeze_backbone_until=N could leave only parameterless modules trainable,
+        # silently freezing the entire backbone regardless of N. Only children with
+        # at least one parameter are eligible to be counted/unfrozen.
         if freeze_backbone_until is not None:
-            children = list(self.base_model.children())
+            children = [c for c in self.base_model.children()
+                        if any(True for _ in c.parameters())]
             n_freeze = max(0, len(children) - freeze_backbone_until)
             for child in children[:n_freeze]:
                 for param in child.parameters():
                     param.requires_grad = False
 
-        # Define the LSTM to process the sequence of frame features.
-        # FIX: batch_first=True so the LSTM interprets input as (batch, seq, feat).
-        self.rnn = nn.LSTM(
-            num_features,
-            hidden_size,
-            n_layers,
-            batch_first=True,
-            bidirectional=bidirectional,
-        )
-        # A bidirectional LSTM concatenates its forward and backward final hidden
-        # states, doubling the feature width that reaches the classifier head.
-        rnn_out_size = hidden_size * (2 if bidirectional else 1)
-        # Model improvement: optional attention pooling over LSTM timestep outputs,
-        # instead of relying only on the final hidden state (see forward()).
-        self.use_attention = use_attention
-        if use_attention:
-            self.attention = nn.Linear(rnn_out_size, 1)
+        if use_conv_lstm:
+            # Model improvement: ConvLSTM path. Recurrence is woven directly into
+            # the spatial feature maps at every timestep instead of being applied
+            # only after full pooling -- see ConvLSTMCell docstring for rationale.
+            self.conv_lstm_hidden_channels = conv_lstm_hidden_channels
+            self.conv_lstm_cell = ConvLSTMCell(num_features, conv_lstm_hidden_channels)
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self.dropout = nn.Dropout(dropout_rate)
+            self.fc = nn.Linear(conv_lstm_hidden_channels, n_classes)
+        else:
+            # Define the LSTM to process the sequence of frame features.
+            # FIX: batch_first=True so the LSTM interprets input as (batch, seq, feat).
+            self.rnn = nn.LSTM(
+                num_features,
+                hidden_size,
+                n_layers,
+                batch_first=True,
+                bidirectional=bidirectional,
+            )
+            # A bidirectional LSTM concatenates its forward and backward final hidden
+            # states, doubling the feature width that reaches the classifier head.
+            rnn_out_size = hidden_size * (2 if bidirectional else 1)
+            # Model improvement: optional attention pooling over LSTM timestep outputs,
+            # instead of relying only on the final hidden state (see forward()).
+            self.use_attention = use_attention
+            if use_attention:
+                self.attention = nn.Linear(rnn_out_size, 1)
 
-        # Define dropout for regularization.
-        self.dropout = nn.Dropout(dropout_rate)
-        # Final fully-connected layer to produce logits for each class.
-        # FIX: this must consume rnn_out_size, not hidden_size -- using hidden_size
-        # here caused a shape-mismatch RuntimeError whenever bidirectional=True,
-        # since the LSTM's actual output width is hidden_size * 2 in that case.
-        self.fc = nn.Linear(rnn_out_size, n_classes)
+            # Define dropout for regularization.
+            self.dropout = nn.Dropout(dropout_rate)
+            # Final fully-connected layer to produce logits for each class.
+            # FIX: this must consume rnn_out_size, not hidden_size -- using hidden_size
+            # here caused a shape-mismatch RuntimeError whenever bidirectional=True,
+            # since the LSTM's actual output width is hidden_size * 2 in that case.
+            self.fc = nn.Linear(rnn_out_size, n_classes)
 
     def forward(self, x, lengths=None):  # pylint: disable=too-many-locals
         """
@@ -168,6 +255,27 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods
             Tensor: Output logits for each sample in the batch with shape (batch_size, n_classes).
         """
         bs, ts, c, h, w = x.shape  # batch_size, time_steps, channels, height, width
+
+        if self.use_conv_lstm:
+            # Model improvement: ConvLSTM path. Extract spatial feature maps per
+            # frame (no pooling yet), then run the ConvLSTM cell over time directly
+            # on those maps -- recurrence is applied at every spatial location,
+            # woven into the feature representation rather than only after the
+            # CNN has already discarded spatial structure via pooling.
+            x = x.view(bs * ts, c, h, w)
+            feat_maps = self.spatial_extractor(x)
+            _, fc_channels, fh, fw = feat_maps.shape
+            feat_maps = feat_maps.view(bs, ts, fc_channels, fh, fw)
+
+            h_t = torch.zeros(bs, self.conv_lstm_hidden_channels, fh, fw, device=x.device)
+            c_t = torch.zeros(bs, self.conv_lstm_hidden_channels, fh, fw, device=x.device)
+            for t in range(ts):
+                h_t, c_t = self.conv_lstm_cell(feat_maps[:, t], h_t, c_t)
+
+            pooled = self.global_pool(h_t).flatten(1)
+            out = self.dropout(pooled)
+            out = self.fc(out)
+            return out
 
         # FIX: vectorize CNN feature extraction across all frames in one call
         # instead of a Python for-loop over time steps (also much faster on GPU).
