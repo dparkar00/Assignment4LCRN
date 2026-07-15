@@ -15,7 +15,7 @@ import glob
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit
 
 import torch
 from torch.utils.data import Dataset
@@ -214,10 +214,43 @@ def load_dataset(frame_dir):
     print('Loading video dataset....')
     for vid_cat in tqdm(sorted(os.listdir(frame_dir))):
         vid_cat_path = os.path.join(frame_dir, vid_cat)
-        for vid in os.listdir(vid_cat_path):
+        for vid in sorted(os.listdir(vid_cat_path)):
             vid_path = os.path.join(vid_cat_path, vid)
             vid_dataset[vid_path] = label_dict[vid_cat]
     return vid_dataset, label_dict
+
+
+def _video_group_id(vid_path):
+    """
+    Extract a stable identifier for the SOURCE video a clip was taken from.
+
+    HMDB51 (and similarly-structured action-recognition datasets) commonly include multiple
+    clips cut from the same underlying source video, following the naming convention
+    '<source_video_title>_<action_class>_<body_pos>_<camera_motion>_<num_people>_<camera_view>_
+    <quality>_<clip_index>' -- e.g. 'April_09_brush_hair_u_nm_np1_ba_goo_0', '..._1', '..._2'
+    are three different clips of the single source video 'April_09'. Splitting at the clip
+    level (treating each as an independent sample) is a data leak: near-identical footage --
+    same actor, room, lighting, camera -- ends up in both train and test, letting the model
+    partially recognize the specific video instead of generalizing the action. Grouping clips
+    by this source-video id (see dataset_split below) keeps all of one video's clips in a
+    single split.
+
+    Args:
+        vid_path (str): Path to a video's frame directory, e.g.
+                         '.../brush_hair/April_09_brush_hair_u_nm_np1_ba_goo_0'.
+
+    Returns:
+        str: The inferred source-video id (e.g. 'April_09'), or the full clip name if the
+             expected '_<action_class>' marker isn't found in it (safe fallback: treats the
+             clip as its own group rather than guessing wrong).
+    """
+    vid_path = vid_path.rstrip('/')
+    vid_name = os.path.basename(vid_path)
+    class_name = os.path.basename(os.path.dirname(vid_path))
+    marker = '_' + class_name
+    if marker in vid_name:
+        return vid_name.split(marker, 1)[0]
+    return vid_name
 
 
 def _to_pairs(paths, labels):
@@ -227,10 +260,14 @@ def _to_pairs(paths, labels):
 
 def dataset_split(vid_dataset, tr_ratio, ts_ratio, seed=0):  # pylint: disable=too-many-locals
     """
-    Split the dataset into training, validation, and test sets using stratified sampling.
+    Split the dataset into training, validation, and test sets, grouped by source video.
 
-    This function uses StratifiedShuffleSplit to ensure that each split has a representative
-    distribution of classes.
+    Uses GroupShuffleSplit (grouped by _video_group_id) rather than a plain stratified split,
+    so that every clip taken from the same source video ends up in exactly one of train/val/
+    test -- never spread across more than one. A plain per-clip stratified split would leak:
+    HMDB51-style datasets frequently contain multiple clips per source video, so randomly
+    assigning individual clips to splits lets near-duplicate footage appear in both training
+    and evaluation.
 
     Args:
         vid_dataset (dict): Dictionary mapping video paths to labels.
@@ -246,21 +283,34 @@ def dataset_split(vid_dataset, tr_ratio, ts_ratio, seed=0):  # pylint: disable=t
     """
     vid_paths = np.array(list(vid_dataset.keys()))
     vid_labels = np.array(list(vid_dataset.values()))
-    print('Splitting train/validation/test datasets....')
+    groups = np.array([_video_group_id(p) for p in vid_paths])
+    print('Splitting train/validation/test datasets (grouped by source video)....')
 
-    # Test split using StratifiedShuffleSplit
-    ts_spliter = StratifiedShuffleSplit(n_splits=1, test_size=ts_ratio, random_state=seed)
-    for tr_val_idx, ts_idx in ts_spliter.split(vid_paths, vid_labels):
+    # Test split using GroupShuffleSplit
+    ts_spliter = GroupShuffleSplit(n_splits=1, test_size=ts_ratio, random_state=seed)
+    for tr_val_idx, ts_idx in ts_spliter.split(vid_paths, vid_labels, groups=groups):
         ts_dataset = _to_pairs(vid_paths[ts_idx], vid_labels[ts_idx])
         tr_val_paths, tr_val_labels = vid_paths[tr_val_idx], vid_labels[tr_val_idx]
+        tr_val_groups = groups[tr_val_idx]
+        ts_groups = groups[ts_idx]
 
     # Train/validation split
     val_ratio = 1 - tr_ratio - ts_ratio
     val_wt = val_ratio / (tr_ratio + val_ratio)
-    val_spliter = StratifiedShuffleSplit(n_splits=1, test_size=val_wt, random_state=seed)
-    for tr_idx, val_idx in val_spliter.split(tr_val_paths, tr_val_labels):
+    val_spliter = GroupShuffleSplit(n_splits=1, test_size=val_wt, random_state=seed)
+    for tr_idx, val_idx in val_spliter.split(tr_val_paths, tr_val_labels, groups=tr_val_groups):
         tr_dataset = _to_pairs(tr_val_paths[tr_idx], tr_val_labels[tr_idx])
         val_dataset = _to_pairs(tr_val_paths[val_idx], tr_val_labels[val_idx])
+        tr_groups = set(tr_val_groups[tr_idx])
+        val_groups = set(tr_val_groups[val_idx])
+
+    # Verification: confirm no source-video group spans more than one split. This is both a
+    # safety check and evidence (for e.g. a README writeup) that the leak is actually fixed.
+    ts_group_set = set(ts_groups)
+    overlap = (tr_groups & val_groups) | (tr_groups & ts_group_set) | (val_groups & ts_group_set)
+    print(f'Source-video groups -- train: {len(tr_groups)}, val: {len(val_groups)}, '
+          f'test: {len(ts_group_set)}, cross-split overlap: {len(overlap)} (must be 0)')
+    assert not overlap, f'Data leak: {len(overlap)} source video(s) span more than one split!'
 
     return tr_dataset, val_dataset, ts_dataset
 
