@@ -39,8 +39,7 @@ from tqdm import tqdm
 from video_datasets import (VideoDataset, TwoStreamVideoDataset, load_dataset,
                              dataset_split, collate_fn_two_stream)
 from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
-                    test_dloaders, compute_flow_frames, store_frames,
-                    NUM_WORKERS, PIN_MEMORY)
+                    test_dloaders, compute_flow_frames, store_frames, dataloader_kwargs)
 from models import LRCN, TwoStreamI3D
 from train import train
 from test import test  # pylint: disable=wrong-import-order
@@ -166,11 +165,9 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
         val_dataset = TwoStreamVideoDataset(val_split, args.flow_dir, args.fr_per_vid,
                                              val_ts_transforms, val_ts_transforms)
         train_dl = DataLoader(tr_dataset, batch_size=args.batch_size, shuffle=True,
-                               collate_fn=collate_fn_two_stream,
-                               num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+                               collate_fn=collate_fn_two_stream, **dataloader_kwargs())
         val_dl = DataLoader(val_dataset, batch_size=2 * args.batch_size, shuffle=False,
-                             collate_fn=collate_fn_two_stream,
-                             num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+                             collate_fn=collate_fn_two_stream, **dataloader_kwargs())
         return {'train': train_dl, 'val': val_dl}
 
     tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms)
@@ -238,7 +235,7 @@ def run_eval(args, model, device, val_ts_transforms):
                                             val_ts_transforms, val_ts_transforms)
         dataloaders = {'test': DataLoader(ts_dataset, batch_size=2 * args.batch_size,
                                            shuffle=False, collate_fn=collate_fn_two_stream,
-                                           num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)}
+                                           **dataloader_kwargs())}
     else:
         ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms)
         dataloaders = test_dloaders(ts_dataset, args.batch_size, args.model_type)
@@ -301,6 +298,11 @@ def main(args):
         return
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        # Input shapes (batch size, frame count, resolution) are fixed for the duration of a
+        # run, so let cuDNN auto-tune and cache the fastest convolution algorithms for them --
+        # a real speedup with no effect on what the model computes, just how fast it computes it.
+        torch.backends.cudnn.benchmark = True
 
     # Load transformation statistics and create data augmentation transforms
     h, w, mean, std = transform_stats(args.model_type)

@@ -21,13 +21,34 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from video_datasets import collate_fn_r3d_18, collate_fn_rnn
 
-# Parallel data loading matters a lot here: video clips are loaded frame-by-frame from disk as
+# Parallel data loading matters a LOT here: video clips are loaded frame-by-frame from disk as
 # individual JPEGs (doubled for two-stream, since RGB and flow are each loaded separately), which
-# is I/O- and CPU-bound. Without multiple worker processes, the GPU sits idle waiting on this.
-# pin_memory speeds up the host->GPU transfer once a batch is ready. Tune NUM_WORKERS down to 0
-# if running somewhere with very few CPU cores available.
-NUM_WORKERS = 2
+# is I/O- and CPU-bound. With num_workers=0, this happens serially on one thread while the GPU
+# sits idle waiting -- for two-stream I3D, back-of-envelope FLOP math suggests actual observed
+# iteration time can run an order of magnitude past what GPU compute alone would predict, which
+# points at data loading, not the model, as the dominant cost. This scales workers to the actual
+# machine instead of a fixed guess; if Colab only grants 2 CPU cores, this won't manufacture more
+# parallelism than exists, but it won't leave workers on the table either.
+NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 PIN_MEMORY = True
+
+
+def dataloader_kwargs():
+    """
+    Extra DataLoader kwargs for parallel, prefetching data loading, centralized here so every
+    DataLoader in this project uses the same, valid combination. persistent_workers keeps worker
+    processes alive between epochs instead of respawning them each time (meaningful with many
+    short epochs); prefetch_factor keeps more batches queued ahead of the GPU so it's less
+    likely to stall. Both are only valid arguments when num_workers > 0.
+
+    Returns:
+        dict: Kwargs to unpack into a DataLoader(...) call.
+    """
+    kwargs = {'num_workers': NUM_WORKERS, 'pin_memory': PIN_MEMORY}
+    if NUM_WORKERS > 0:
+        kwargs['persistent_workers'] = True
+        kwargs['prefetch_factor'] = 4
+    return kwargs
 
 
 def get_frames(vid, n_frames=1):
@@ -217,7 +238,7 @@ def compose_dataloaders(train_dataset, val_dataset, test_dataset, batch_size, mo
         dict: Dictionary with keys 'train', 'val', and 'test' mapping to their DataLoaders.
     """
     collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
-    loader_kwargs = {'num_workers': NUM_WORKERS, 'pin_memory': PIN_MEMORY, 'collate_fn': collate_fn}
+    loader_kwargs = {'collate_fn': collate_fn, **dataloader_kwargs()}
     train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_dl = DataLoader(val_dataset, batch_size=2 * batch_size, shuffle=False, **loader_kwargs)
     test_dl = DataLoader(test_dataset, batch_size=2 * batch_size, shuffle=False, **loader_kwargs)
@@ -243,9 +264,9 @@ def train_val_dloaders(train_dataset, val_dataset, batch_size, model='lrcn'):
     """
     collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
     train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+                          collate_fn=collate_fn, **dataloader_kwargs())
     val_dl = DataLoader(val_dataset, batch_size=2 * batch_size, shuffle=False,
-                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+                        collate_fn=collate_fn, **dataloader_kwargs())
     dataloaders = {'train': train_dl, 'val': val_dl}
     return dataloaders
 
@@ -267,6 +288,6 @@ def test_dloaders(test_dataset, batch_size, model='lrcn'):
     """
     collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
     test_dl = DataLoader(test_dataset, batch_size=2 * batch_size, shuffle=False,
-                         collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+                         collate_fn=collate_fn, **dataloader_kwargs())
     dataloaders = {'test': test_dl}
     return dataloaders
