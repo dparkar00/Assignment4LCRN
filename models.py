@@ -15,11 +15,78 @@ Classes:
 
 import torch
 from torch import nn
-
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torchvision import models
 
-class Identity(nn.Module):  # pylint: disable=too-few-public-methods
+
+class I3DStream(nn.Module):
+    """
+    Single-stream I3D (ResNet-50 3D backbone, Kinetics-400 pretrained) classifier.
+
+    Loaded via torch.hub from the pytorchvideo model zoo. This is the modern I3D-R50 variant
+    (Kinetics-pretrained weights are readily available for it, unlike the original Inception-v1
+    based I3D). Used as-is for either the RGB stream or the optical-flow stream, since both are
+    encoded as 3-channel clips of shape (batch, 3, time, H, W).
+
+    Args:
+        n_classes (int): Number of output classes.
+        pretrained (bool): If True, load Kinetics-400 pretrained weights.
+    """
+    def __init__(self, n_classes, pretrained=True):
+        super().__init__()
+        self.backbone = torch.hub.load('facebookresearch/pytorchvideo', 'i3d_r50',
+                                        pretrained=pretrained)
+        # Replace the Kinetics-400 head (400 classes) with one sized for this task.
+        in_features = self.backbone.blocks[-1].proj.in_features
+        self.backbone.blocks[-1].proj = nn.Linear(in_features, n_classes)
+
+    def forward(self, x):
+        """
+        Args:
+            x (Tensor): Clip tensor of shape (batch, 3, time, H, W).
+        Returns:
+            Tensor: Class logits of shape (batch, n_classes).
+        """
+        return self.backbone(x)
+
+
+class TwoStreamI3D(nn.Module):
+    """
+    Two-stream I3D model: an RGB stream and an optical-flow stream, combined via late fusion
+    (weighted average of per-stream softmax probabilities) as in the standard two-stream action
+    recognition design.
+
+    Args:
+        n_classes (int): Number of output classes.
+        pretrained (bool): If True, initialize both streams from Kinetics-400 pretrained weights.
+        flow_weight (float): Weight given to the flow stream in the fused prediction (0-1); the
+                              RGB stream gets (1 - flow_weight). Flow is weighted slightly higher
+                              than RGB by default, following the two-stream literature.
+    """
+    def __init__(self, n_classes, pretrained=True, flow_weight=0.6):
+        super().__init__()
+        self.rgb_stream = I3DStream(n_classes, pretrained=pretrained)
+        self.flow_stream = I3DStream(n_classes, pretrained=pretrained)
+        self.flow_weight = flow_weight
+
+    def forward(self, rgb, flow):
+        """
+        Args:
+            rgb (Tensor): RGB clip tensor of shape (batch, 3, time, H, W).
+            flow (Tensor): Optical-flow clip tensor of shape (batch, 3, time, H, W).
+        Returns:
+            Tensor: Fused log-probabilities of shape (batch, n_classes). Returns
+                    log-probabilities (not raw logits) so it pairs with nn.NLLLoss, since the
+                    fusion has to happen in probability space (a weighted average of two
+                    probability distributions is not equivalent to a weighted average of two
+                    logit vectors).
+        """
+        rgb_probs = torch.softmax(self.rgb_stream(rgb), dim=1)
+        flow_probs = torch.softmax(self.flow_stream(flow), dim=1)
+        fused_probs = (1 - self.flow_weight) * rgb_probs + self.flow_weight * flow_probs
+        return torch.log(fused_probs + 1e-8)
+
+
+class Identity(nn.Module):
     """
     A placeholder identity operator that is argument-insensitive.
 
@@ -30,7 +97,6 @@ class Identity(nn.Module):  # pylint: disable=too-few-public-methods
         >>> identity = Identity()
         >>> output = identity(input_tensor)
     """
-
     def forward(self, x):
         """
         Forward pass that returns the input as is.
@@ -43,74 +109,15 @@ class Identity(nn.Module):  # pylint: disable=too-few-public-methods
         """
         return x
 
-_BACKBONES = {
-    "resnet18": models.resnet18,
-    "resnet34": models.resnet34,
-    "resnet50": models.resnet50,
-    "resnet101": models.resnet101,
-    "resnet152": models.resnet152,
-}
 
-class ConvLSTMCell(nn.Module):
-    """
-    Model improvement: a single ConvLSTM cell (Shi et al., 2015).
-
-    A standard LSTM's gates are fully-connected, so it can only operate on flat
-    feature vectors -- which means the CNN backbone must fully collapse each
-    frame's spatial structure (via global average pooling) *before* any temporal
-    modeling happens, and the LSTM only ever sees a sequence of already-pooled
-    vectors "tacked on" after the CNN.
-
-    ConvLSTM replaces the fully-connected gates with convolutions, so it can
-    operate directly on (C, H, W) spatial feature maps. This lets recurrence be
-    woven directly into the spatial feature representation at every timestep,
-    instead of being applied only after the CNN has already discarded spatial
-    structure via pooling.
-    """
-    def __init__(self, input_channels, hidden_channels, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        # A single convolution produces all four gates (input, forget, output,
-        # candidate) at once, taking the concatenation of the current input map
-        # and the previous hidden state map as its input.
-        self.conv = nn.Conv2d(
-            input_channels + hidden_channels,
-            4 * hidden_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-        self.hidden_channels = hidden_channels
-
-    def forward(self, x_t, h_prev, c_prev):
-        """
-        Args:
-            x_t (Tensor): Input feature map for the current timestep, (B, C_in, H, W).
-            h_prev (Tensor): Previous hidden state map, (B, C_hidden, H, W).
-            c_prev (Tensor): Previous cell state map, (B, C_hidden, H, W).
-
-        Returns:
-            tuple: (h_t, c_t), the updated hidden and cell state maps.
-        """
-        combined = torch.cat([x_t, h_prev], dim=1)
-        gates = self.conv(combined)
-        in_gate, forget_gate, out_gate, cand_gate = torch.chunk(gates, 4, dim=1)
-        in_gate = torch.sigmoid(in_gate)
-        forget_gate = torch.sigmoid(forget_gate)
-        out_gate = torch.sigmoid(out_gate)
-        cand_gate = torch.tanh(cand_gate)
-
-        c_t = forget_gate * c_prev + in_gate * cand_gate
-        h_t = out_gate * torch.tanh(c_t)
-        return h_t, c_t
-
-class LRCN(nn.Module):  # pylint: disable=too-few-public-methods,too-many-instance-attributes
+class LRCN(nn.Module):
     """
     LRCN (Long-term Recurrent Convolutional Network) for video classification.
 
-    This model uses a ResNet backbone as a 2D CNN to extract spatial features from each
-    video frame. An LSTM network is then used to model the temporal dynamics across the
-    sequence of frame features. Dropout is applied before the final fully-connected layer
-    that produces class logits.
+    This model uses a ResNet backbone as a 2D CNN to extract spatial features from each video
+    frame. An LSTM network is then used to model the temporal dynamics across the sequence of
+    frame features. Dropout is applied before the final fully-connected layer that produces
+    class logits.
 
     Args:
         hidden_size (int): Number of features in the hidden state of the LSTM.
@@ -118,400 +125,80 @@ class LRCN(nn.Module):  # pylint: disable=too-few-public-methods,too-many-instan
         dropout_rate (float): Dropout rate applied before the final classification layer.
         n_classes (int): Number of output classes.
         pretrained (bool, optional): If True, uses a ResNet model pretrained on ImageNet.
-            Default is True.
+                                      Default is True.
         cnn_model (str, optional): Specifies the ResNet variant to use as the backbone.
-            Options: 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152'.
-            Default is 'resnet34'.
-        freeze_backbone_until (int, optional): If set, freezes all backbone parameters
-            except the last N children modules, for cheaper/more stable fine-tuning
-            (model-level improvement).
-        bidirectional (bool, optional): Use a bidirectional LSTM (model-level improvement).
-        use_attention (bool, optional): Model improvement -- instead of using only the
-            LSTM's final hidden state, learn an attention weight over every timestep's
-            output and pool them into a weighted context vector. Useful when the most
-            discriminative motion in a clip doesn't occur at the very last frame.
-        use_conv_lstm (bool, optional): Model improvement -- replace the standard
-            fully-connected LSTM (applied only after full spatial pooling) with a
-            ConvLSTM that operates directly on the CNN's spatial feature maps at
-            every timestep, weaving recurrence throughout the model instead of
-            tacking it on at the end. Mutually exclusive with bidirectional/
-            use_attention, which apply to the standard LSTM path.
-        conv_lstm_hidden_channels (int, optional): Number of hidden channels in the
-            ConvLSTM cell, used only when use_conv_lstm=True. Default is 128.
+                                   Options: 'resnet18', 'resnet34', 'resnet50', 'resnet101',
+                                   'resnet152'. Default is 'resnet34'.
 
     Raises:
         ValueError: If the specified cnn_model is not supported.
     """
-    # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    def __init__(
-        self,
-        hidden_size,
-        n_layers,
-        dropout_rate,
-        n_classes,
-        pretrained=True,
-        cnn_model="resnet34",
-        freeze_backbone_until=None,
-        bidirectional=False,
-        use_attention=False,
-        use_conv_lstm=False,
-        conv_lstm_hidden_channels=128,
-    ):
+    def __init__(self, hidden_size, n_layers, dropout_rate, n_classes,
+                 pretrained=True, cnn_model='resnet34'):
         super().__init__()
 
-        if cnn_model not in _BACKBONES:
-            raise ValueError(
-                f"Unsupported cnn_model '{cnn_model}'. Choose from {list(_BACKBONES)}."
-            )
-
-        base_cnn = _BACKBONES[cnn_model](pretrained=pretrained)
+        # Set up the ResNet backbone as a 2D CNN feature extractor.
+        weights = 'DEFAULT' if pretrained else None
+        if cnn_model == 'resnet18':
+            base_cnn = models.resnet18(weights=weights)
+        elif cnn_model == 'resnet34':
+            base_cnn = models.resnet34(weights=weights)
+        elif cnn_model == 'resnet50':
+            base_cnn = models.resnet50(weights=weights)
+        elif cnn_model == 'resnet101':
+            base_cnn = models.resnet101(weights=weights)
+        elif cnn_model == 'resnet152':
+            # Note: This example uses resnet34 for resnet152 option as a placeholder.
+            base_cnn = models.resnet152(weights=weights)
+        else:
+            raise ValueError('The input CNN backbone is not supported, '
+                              'please choose a valid ResNet variant.')
 
         # Retrieve the number of features output by the CNN's original fully-connected layer.
         num_features = base_cnn.fc.in_features
 
-        # Replace the original fc layer with an identity mapping so raw features are returned.
+        # Replace the original fc layer with an identity mapping so that raw features are returned.
         base_cnn.fc = Identity()
         self.base_model = base_cnn
 
-        # Model improvement: use_conv_lstm needs the CNN's raw spatial feature maps
-        # (C, H, W), not the fully pooled+flattened vector base_model produces. Build
-        # a second view of the backbone that stops right before its own internal
-        # average pool, so both paths below can share the same underlying weights.
-        self.use_conv_lstm = use_conv_lstm
-        if use_conv_lstm:
-            # All backbone children except the final adaptive avg pool and fc layer.
-            self.spatial_extractor = nn.Sequential(*list(base_cnn.children())[:-2])
+        # Define the LSTM to process the sequence of frame features.
+        self.rnn = nn.LSTM(num_features, hidden_size, n_layers, batch_first=True)
 
-        # Model improvement: optional partial backbone freezing for more stable,
-        # cheaper fine-tuning on a modest-sized dataset.
-        # BUG FIX: children() includes parameterless modules (avgpool, the Identity
-        # fc replacement, etc.). Counting those toward "last N children" meant
-        # freeze_backbone_until=N could leave only parameterless modules trainable,
-        # silently freezing the entire backbone regardless of N. Only children with
-        # at least one parameter are eligible to be counted/unfrozen.
-        if freeze_backbone_until is not None:
-            children = [c for c in self.base_model.children()
-                        if any(True for _ in c.parameters())]
-            n_freeze = max(0, len(children) - freeze_backbone_until)
-            for child in children[:n_freeze]:
-                for param in child.parameters():
-                    param.requires_grad = False
+        # Define dropout for regularization.
+        self.dropout = nn.Dropout(dropout_rate)
 
-        if use_conv_lstm:
-            # Model improvement: ConvLSTM path. Recurrence is woven directly into
-            # the spatial feature maps at every timestep instead of being applied
-            # only after full pooling -- see ConvLSTMCell docstring for rationale.
-            self.conv_lstm_hidden_channels = conv_lstm_hidden_channels
-            self.conv_lstm_cell = ConvLSTMCell(num_features, conv_lstm_hidden_channels)
-            self.global_pool = nn.AdaptiveAvgPool2d(1)
-            self.dropout = nn.Dropout(dropout_rate)
-            self.fc = nn.Linear(conv_lstm_hidden_channels, n_classes)
-        else:
-            # Define the LSTM to process the sequence of frame features.
-            # FIX: batch_first=True so the LSTM interprets input as (batch, seq, feat).
-            self.rnn = nn.LSTM(
-                num_features,
-                hidden_size,
-                n_layers,
-                batch_first=True,
-                bidirectional=bidirectional,
-            )
-            # A bidirectional LSTM concatenates its forward and backward final hidden
-            # states, doubling the feature width that reaches the classifier head.
-            rnn_out_size = hidden_size * (2 if bidirectional else 1)
-            # Model improvement: optional attention pooling over LSTM timestep outputs,
-            # instead of relying only on the final hidden state (see forward()).
-            self.use_attention = use_attention
-            if use_attention:
-                self.attention = nn.Linear(rnn_out_size, 1)
+        # Final fully-connected layer to produce logits for each class.
+        self.fc = nn.Linear(hidden_size, n_classes)
 
-            # Define dropout for regularization.
-            self.dropout = nn.Dropout(dropout_rate)
-            # Final fully-connected layer to produce logits for each class.
-            # FIX: this must consume rnn_out_size, not hidden_size -- using hidden_size
-            # here caused a shape-mismatch RuntimeError whenever bidirectional=True,
-            # since the LSTM's actual output width is hidden_size * 2 in that case.
-            self.fc = nn.Linear(rnn_out_size, n_classes)
-
-    def forward(self, x, lengths=None):  # pylint: disable=too-many-locals
+    def forward(self, x):
         """
         Forward pass for the LRCN model.
 
         The input tensor x is expected to have the shape:
             (batch_size, time_steps, channels, height, width)
 
-        The CNN backbone extracts features from all frames in a single batched call,
-        then the full sequence is passed through the LSTM. The final hidden state(s)
-        are passed through dropout and the final fully-connected layer to produce
-        the class logits.
+        For each time step (frame), the CNN backbone extracts features. These features are then
+        passed through the LSTM sequentially. The output from the last time step is then passed
+        through dropout and the final fully-connected layer to produce the class logits.
 
         Args:
             x (Tensor): Input tensor of shape (batch_size, time_steps, channels, height, width).
-            lengths (Tensor, optional): True (unpadded) sequence length per sample. When
-                provided, padded frames are excluded from the LSTM computation via
-                pack_padded_sequence instead of being fed through as garbage input.
 
         Returns:
             Tensor: Output logits for each sample in the batch with shape (batch_size, n_classes).
         """
         bs, ts, c, h, w = x.shape  # batch_size, time_steps, channels, height, width
 
-        if self.use_conv_lstm:
-            # Model improvement: ConvLSTM path. Extract spatial feature maps per
-            # frame (no pooling yet), then run the ConvLSTM cell over time directly
-            # on those maps -- recurrence is applied at every spatial location,
-            # woven into the feature representation rather than only after the
-            # CNN has already discarded spatial structure via pooling.
-            x = x.view(bs * ts, c, h, w)
-            feat_maps = self.spatial_extractor(x)
-            _, fc_channels, fh, fw = feat_maps.shape
-            feat_maps = feat_maps.view(bs, ts, fc_channels, fh, fw)
+        # Extract CNN features for every frame in the clip in one pass (folding time into batch),
+        # then feed the whole (batch, time, features) sequence to the LSTM in a single call so
+        # batch and time are never conflated.
+        y = self.base_model(x.reshape(bs * ts, c, h, w))
+        y = y.view(bs, ts, -1)
+        out, _ = self.rnn(y)
 
-            h_t = torch.zeros(bs, self.conv_lstm_hidden_channels, fh, fw, device=x.device)
-            c_t = torch.zeros(bs, self.conv_lstm_hidden_channels, fh, fw, device=x.device)
-            for t in range(ts):
-                h_t, c_t = self.conv_lstm_cell(feat_maps[:, t], h_t, c_t)
+        # Apply dropout to the output of the final time step.
+        out = self.dropout(out[:, -1])
 
-            pooled = self.global_pool(h_t).flatten(1)
-            out = self.dropout(pooled)
-            out = self.fc(out)
-            return out
-
-        # FIX: vectorize CNN feature extraction across all frames in one call
-        # instead of a Python for-loop over time steps (also much faster on GPU).
-        x = x.view(bs * ts, c, h, w)
-        feats = self.base_model(x)
-        feats = feats.view(bs, ts, -1)
-
-        if lengths is not None:
-            packed = pack_padded_sequence(
-                feats, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            packed_out, (hn, _cn) = self.rnn(packed)
-            # Recover per-timestep outputs (needed for attention pooling below).
-            # Padded timesteps come back as zeros and are masked out explicitly.
-            rnn_out, out_lengths = pad_packed_sequence(packed_out, batch_first=True)
-        else:
-            rnn_out, (hn, _cn) = self.rnn(feats)
-            out_lengths = torch.full((bs,), ts, dtype=torch.long, device=x.device)
-
-        if self.use_attention:
-            # Model improvement: attention pooling. Score every timestep's LSTM
-            # output, mask out padded positions so they can never receive weight,
-            # softmax over time, then take the weighted sum as the context vector
-            # -- lets the model emphasize whichever frames are most discriminative
-            # instead of always trusting only the final timestep.
-            attn_scores = self.attention(rnn_out).squeeze(-1)  # (batch, seq)
-            time_idx = torch.arange(rnn_out.size(1), device=rnn_out.device)
-            mask = time_idx[None, :] < out_lengths.to(rnn_out.device)[:, None]
-            attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
-            attn_weights = torch.softmax(attn_scores, dim=1)
-            last_hidden = torch.sum(rnn_out * attn_weights.unsqueeze(-1), dim=1)
-        elif self.rnn.bidirectional:
-            # hn shape: (num_layers * num_directions, batch, hidden_size).
-            # Take the last layer's hidden state(s).
-            last_hidden = torch.cat([hn[-2], hn[-1]], dim=1)
-        else:
-            last_hidden = hn[-1]
-
-        # Apply dropout to the final hidden state.
-        out = self.dropout(last_hidden)
         # Pass the final output through the fully-connected layer to get class logits.
         out = self.fc(out)
         return out
-
-
-class R3DClassifier(nn.Module):  # pylint: disable=too-few-public-methods
-    """
-    Model improvement: a 3D CNN video classifier (R3D-18), pretrained on
-    Kinetics-400, used as an alternative to the LRCN's 2D-CNN-plus-RNN approach.
-
-    Unlike LRCN, which extracts per-frame appearance features and only models
-    temporal dynamics afterward via a separate recurrent unit, a 3D CNN applies
-    3D convolutions across space AND time jointly from the very first layer, so
-    it directly represents motion rather than inferring it indirectly from a
-    sequence of independent per-frame feature vectors. Kinetics-400 pretraining
-    also means the backbone starts already familiar with action/motion patterns,
-    rather than only static ImageNet object categories.
-
-    Uses video_datasets.collate_fn_r3d_18 and utils.transform_stats('3dcnn'),
-    both of which already existed in this codebase but were never wired up to
-    an actual 3D CNN model.
-
-    Args:
-        n_classes (int): Number of output classes.
-        pretrained (bool, optional): Use Kinetics-400 pretrained weights. Default True.
-        freeze_backbone_until (int, optional): If set, freezes all backbone parameters
-            except the last N children modules, matching LRCN's partial-freezing option.
-    """
-    def __init__(self, n_classes, pretrained=True, freeze_backbone_until=None):
-        super().__init__()
-        weights = models.video.R3D_18_Weights.KINETICS400_V1 if pretrained else None
-        base_cnn = models.video.r3d_18(weights=weights)
-
-        num_features = base_cnn.fc.in_features
-        base_cnn.fc = Identity()
-        self.base_model = base_cnn
-
-        if freeze_backbone_until is not None:
-            children = [c for c in self.base_model.children()
-                        if any(True for _ in c.parameters())]
-            n_freeze = max(0, len(children) - freeze_backbone_until)
-            for child in children[:n_freeze]:
-                for param in child.parameters():
-                    param.requires_grad = False
-
-        self.fc = nn.Linear(num_features, n_classes)
-
-    def forward(self, x, lengths=None):  # pylint: disable=unused-argument
-        """
-        Args:
-            x (Tensor): Input of shape (batch_size, channels, time_steps, height,
-                width) -- note channel-first-then-time, matching
-                video_datasets.collate_fn_r3d_18's output layout, which differs
-                from LRCN's (batch, time_steps, channels, height, width).
-            lengths: Unused. Accepted only so train.py/test.py can call
-                model(x, lengths=lengths) the same way for both LRCN and
-                R3DClassifier without model-type-specific branching. R3D-18 has
-                no notion of variable-length/padded sequences the way the LSTM
-                path does.
-
-        Returns:
-            Tensor: Class logits of shape (batch_size, n_classes).
-        """
-        feats = self.base_model(x)
-        out = self.fc(feats)
-        return out
-
-
-class TwoStreamR3D(nn.Module):  # pylint: disable=too-few-public-methods
-    """
-    Model improvement: two-stream RGB + optical-flow architecture, in the spirit
-    of I3D (Carreira & Zisserman, 2017). The I3D paper's own ablation shows
-    RGB-only ~74%, Flow-only ~77%, but fusing both streams reaches ~80.9% on
-    HMDB51 -- optical flow gives the model direct access to motion information
-    that a single appearance stream can only infer indirectly from how features
-    change across a sequence of independent frames.
-
-    NOTE: this uses two Kinetics-400-pretrained R3D-18 backbones (one per
-    stream) rather than a from-scratch reimplementation of the exact Inflated-
-    Inception-v1 architecture from the I3D paper. A hand-rolled reimplementation
-    without verified Kinetics-pretrained weights would not benefit from the
-    pretraining that actually drives I3D's published results. The mechanism
-    that matters -- fusing an appearance stream and a motion stream -- is
-    preserved; late fusion of independently pretrained 3D CNN backbones is a
-    standard way to build a two-stream architecture (Simonyan & Zisserman,
-    2014; Carreira & Zisserman, 2017).
-
-    Expects input of shape (batch, 5, time_steps, height, width): channels 0-2
-    are RGB, channels 3-4 are optical flow (x, y components), produced by
-    VideoDataset(compute_flow=True) + collate_fn_r3d_18.
-
-    Args:
-        n_classes (int): Number of output classes.
-        pretrained (bool, optional): Use Kinetics-400 pretrained weights for the
-            RGB stream. Default True. The flow stream's first conv layer can't
-            use the RGB-pretrained weights directly (3 vs 2 input channels), so
-            it's initialized by averaging the RGB stream's pretrained first-
-            layer weights across channels and replicating across the 2 flow
-            channels -- a standard cross-modality initialization trick from the
-            two-stream literature, rather than starting the flow stream from
-            random weights.
-        freeze_backbone_until (int, optional): Applied identically to both streams.
-    """
-    def __init__(self, n_classes, pretrained=True, freeze_backbone_until=None):
-        super().__init__()
-        self.rgb_stream = R3DClassifier(
-            n_classes, pretrained=pretrained, freeze_backbone_until=freeze_backbone_until
-        )
-        self.flow_stream = R3DClassifier(
-            n_classes, pretrained=pretrained, freeze_backbone_until=freeze_backbone_until
-        )
-
-        # NOTE: base_model here is an nn.ModuleList referencing the *same*
-        # underlying backbone parameter tensors already registered under
-        # self.rgb_stream/self.flow_stream -- it exists purely so run.py's
-        # differential-learning-rate code (which reads model.base_model.parameters()
-        # for every model type) works unchanged for TwoStreamR3D too. run.py
-        # already dedupes parameters by identity before building optimizer
-        # groups, so this intentional double-registration is harmless.
-        self.base_model = nn.ModuleList([self.rgb_stream.base_model, self.flow_stream.base_model])
-
-        # BUG FIX: the flow stream's first conv layer must be adapted to accept
-        # 2 input channels (flow x/y) regardless of --pretrained, since the
-        # backbone is built with a standard 3-channel RGB stem either way.
-        # Originally this was only done "if pretrained", so with
-        # --pretrained False the flow stream kept its 3-channel stem and
-        # crashed on the very first forward pass with a real (2-channel) flow
-        # input. Only the *weight initialization source* should depend on
-        # pretrained -- copied from the RGB stream's pretrained weights when
-        # available, or left at PyTorch's default random init otherwise.
-        self._adapt_flow_stream_first_conv(init_from_rgb=pretrained)
-
-    def _adapt_flow_stream_first_conv(self, init_from_rgb):
-        """Replace the flow stream's first conv to accept 2 channels instead of 3."""
-        first_conv = self._find_first_conv(self.flow_stream.base_model)
-        if first_conv is None:
-            return
-        new_conv = nn.Conv3d(
-            2, first_conv.out_channels, kernel_size=first_conv.kernel_size,
-            stride=first_conv.stride, padding=first_conv.padding,
-            bias=first_conv.bias is not None,
-        )
-        if init_from_rgb:
-            # Explicitly source weights from the RGB stream's first conv (not
-            # the flow stream's own, about-to-be-replaced conv) so this is
-            # correct regardless of how each stream happened to be initialized,
-            # matching what the class docstring actually promises.
-            rgb_first_conv = self._find_first_conv(self.rgb_stream.base_model)
-            with torch.no_grad():
-                rgb_weight = rgb_first_conv.weight  # (out_C, 3, kT, kH, kW)
-                flow_weight = rgb_weight.mean(dim=1, keepdim=True).repeat(1, 2, 1, 1, 1)
-                new_conv.weight.copy_(flow_weight)
-                if rgb_first_conv.bias is not None:
-                    new_conv.bias.copy_(rgb_first_conv.bias)
-        self._replace_first_conv(self.flow_stream.base_model, new_conv)
-
-    @staticmethod
-    def _find_first_conv(module):
-        """Recursively find the first nn.Conv3d submodule."""
-        for child in module.children():
-            if isinstance(child, nn.Conv3d):
-                return child
-            found = TwoStreamR3D._find_first_conv(child)
-            if found is not None:
-                return found
-        return None
-
-    @staticmethod
-    def _replace_first_conv(module, new_conv):
-        """Recursively find and replace the first nn.Conv3d submodule in-place."""
-        for name, child in module.named_children():
-            if isinstance(child, nn.Conv3d):
-                setattr(module, name, new_conv)
-                return True
-            if TwoStreamR3D._replace_first_conv(child, new_conv):
-                return True
-        return False
-
-    def forward(self, x, lengths=None):  # pylint: disable=unused-argument
-        """
-        Args:
-            x (Tensor): (batch, 5, time_steps, height, width) -- channels 0-2
-                RGB, channels 3-4 optical flow (x, y), produced by
-                VideoDataset(compute_flow=True) + collate_fn_r3d_18.
-            lengths: Unused. Accepted only so train.py/test.py can call
-                model(x, lengths=lengths) the same way for every model type.
-
-        Returns:
-            Tensor: Fused class logits, shape (batch_size, n_classes) -- the
-                average of the RGB stream's and flow stream's logits (late
-                fusion), the same score-level fusion strategy used by the
-                original two-stream architectures this design is based on.
-        """
-        rgb = x[:, :3]
-        flow = x[:, 3:5]
-        rgb_logits = self.rgb_stream(rgb)
-        flow_logits = self.flow_stream(flow)
-        fused_logits = (rgb_logits + flow_logits) / 2
-        return fused_logits

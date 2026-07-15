@@ -1,10 +1,10 @@
 """
 Module: run.py
 
-This module is the main entry point for training or evaluating a video classification
-model. It uses command-line arguments to configure the experiment, including dataset
-paths, model parameters, and training hyperparameters. Depending on the selected mode
-('train' or 'eval'), it performs the following:
+This module is the main entry point for training or evaluating a video classification model.
+It uses command-line arguments to configure the experiment, including dataset paths, model
+parameters, and training hyperparameters. Depending on the selected mode ('train' or 'eval'),
+it performs the following:
 
 - Train mode:
     - Loads the dataset from a directory structure.
@@ -23,44 +23,27 @@ paths, model parameters, and training hyperparameters. Depending on the selected
 The module also includes a helper function for parsing command-line arguments.
 """
 
-# pylint: disable=duplicate-code
-# run.py and run_training.py intentionally share a similar argparse setup
-# (two working entry points, per project requirements); the overlap is
-# expected, not an accidental duplication bug.
-
 import os
+import glob
 import argparse
 
+import numpy as np
 import torch
 from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
+from PIL import Image
+from tqdm import tqdm
 
-import numpy as np
-import wandb
-
-from models import LRCN, R3DClassifier, TwoStreamR3D
-# NOTE: this project's own test.py module shares its name with Python's stdlib
-# "test" package, which is what triggers pylint's import-order warning below for
-# these two lines; the imports still resolve correctly to the local module.
-from test import get_confusion_matrix, get_test_report  # pylint: disable=wrong-import-order
-from test import test as evaluate  # pylint: disable=wrong-import-order
+from video_datasets import (VideoDataset, TwoStreamVideoDataset, load_dataset,
+                             dataset_split, collate_fn_two_stream)
+from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
+                    test_dloaders, compute_flow_frames, store_frames)
+from models import LRCN, TwoStreamI3D
 from train import train
-from utils import compose_data_transforms, test_dloaders, train_val_dloaders, transform_stats
-from video_datasets import VideoDataset, dataset_split, load_dataset
+from test import test  # pylint: disable=wrong-import-order
+# (pylint mistakes this repo's local test.py for the Python stdlib 'test' package by name)
 
-def str2bool(value):
-    """
-    FIX: argparse's `default=True` with no `type=` meant --pretrained False stored
-    the *string* "False", which is truthy, so this flag could never be disabled from
-    the CLI. This helper parses common boolean string forms correctly.
-    """
-    if isinstance(value, bool):
-        return value
-    if value.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    if value.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def args_parser():
     """
@@ -71,323 +54,214 @@ def args_parser():
 
     Arguments include:
         -fd/--frame_dir: Directory for storing video frames.
+        -flowd/--flow_dir: Directory for pre-computed optical flow frames (two-stream mode).
         -trs/--train_size: Proportion of data to use for training (default 0.7).
         -tss/--test_size: Proportion of data to use for testing (default 0.1).
         -fpv/--fr_per_vid: Number of frames per video to consider (default 16).
         -nc/--n_classes: Number of classes for the classification task (required).
         -c/--ckpt: Path for loading a trained model checkpoint.
-        -mt/--model_type: Model type, either '3dcnn' or 'lrcn' (default 'lrcn').
+        -mt/--model_type: Model type, '3dcnn', 'lrcn', or 'i3d_two_stream' (default 'lrcn').
         -cnn/--cnn_backbone: Backbone CNN for 2D feature extraction (default 'resnet34').
         -p/--pretrained: Whether to use a pretrained CNN backbone (default True).
         -rhs/--rnn_hidden_size: Number of neurons in the RNN/LSTM hidden layer (default 100).
         -rnl/--rnn_n_layers: Number of RNN/LSTM layers (default 1).
-        -m/--mode: Mode of operation: 'train' or 'eval' (required).
+        -m/--mode: Mode of operation: 'train', 'eval', or 'preprocess_flow' (required).
         -bs/--batch_size: Mini-batch size (required).
         -d/--dropout: Dropout rate for regularization (default 0.1).
         -lr/--learning_rate: Learning rate for training (default 3e-5).
         -ne/--n_epochs: Number of training epochs (default 30).
     """
-    parser = argparse.ArgumentParser(description="Video Classification Training")
+    parser = argparse.ArgumentParser(description='Video Classification Training')
 
-    parser.add_argument("-fd", "--frame_dir", help="Directory for storing video frames")
-    parser.add_argument("-trs", "--train_size", type=float, default=0.7, help="Train set size")
-    parser.add_argument("-tss", "--test_size", type=float, default=0.1, help="Test set size")
-    parser.add_argument(
-        "-fpv", "--fr_per_vid", type=int, default=16, help="Number of frames per video"
-    )
-    parser.add_argument("-nc", "--n_classes", type=int, required=True, help="Number of classes")
+    parser.add_argument('-fd', '--frame_dir', help='Directory for storing video frames')
+    parser.add_argument('-flowd', '--flow_dir',
+                         help='Directory for pre-computed optical flow frames '
+                              '(required when model_type=i3d_two_stream)')
+    parser.add_argument('-trs', '--train_size', type=float, default=0.7, help='Train set size')
+    parser.add_argument('-tss', '--test_size', type=float, default=0.1, help='Test set size')
+    parser.add_argument('-fpv', '--fr_per_vid', type=int, default=16,
+                         help='Number of frames per video')
+    parser.add_argument('-nc', '--n_classes', type=int, required=True,
+                         help='Number of classes for the classification task')
 
-    parser.add_argument("-c", "--ckpt", help="Path for loading trained model checkpoints")
-    parser.add_argument(
-        "-mt", "--model_type", default="lrcn",
-        help="Model type: 'lrcn', '3dcnn' (R3D-18), or 'i3d' (two-stream RGB+flow)",
-    )
-    parser.add_argument(
-        "-cnn", "--cnn_backbone", default="resnet34",
-        help="2D CNN backbone: resnet18, resnet34, resnet50, resnet101, resnet152",
-    )
-    parser.add_argument(
-        "-p", "--pretrained", type=str2bool, default=True, help="Use pretrained CNN backbone"
-    )
-    parser.add_argument("-rhs", "--rnn_hidden_size", type=int, default=100, help="LSTM hidden size")
-    parser.add_argument("-rnl", "--rnn_n_layers", type=int, default=1, help="Number of LSTM layers")
+    parser.add_argument('-c', '--ckpt', help='Path for loading trained model checkpoints')
+    parser.add_argument('-mt', '--model_type', default='lrcn', help='3D CNN or LRCN')
+    parser.add_argument('-cnn', '--cnn_backbone', default='resnet34',
+                         help='2D CNN backbone - options: resnet18, resnet34, resnet50, '
+                              'resnet101, resnet152')
+    parser.add_argument('-p', '--pretrained', default=True,
+                         help='Use pretrained 2D CNN backbone')
+    parser.add_argument('-rhs', '--rnn_hidden_size', type=int, default=100,
+                         help='Number of neurons in the RNN/LSTM hidden layer')
+    parser.add_argument('-rnl', '--rnn_n_layers', type=int, default=1,
+                         help='Number of RNN/LSTM layers')
 
-    # Model-level improvements (see README for rationale).
-    parser.add_argument(
-        "-bi", "--bidirectional", type=str2bool, default=False,
-        help="Use a bidirectional LSTM (model improvement)",
-    )
-    parser.add_argument(
-        "-att", "--use_attention", type=str2bool, default=False,
-        help="Use attention pooling over LSTM timestep outputs instead of only the "
-             "final hidden state (model improvement)",
-    )
-    parser.add_argument(
-        "-cls", "--use_conv_lstm", type=str2bool, default=False,
-        help="Replace the standard LSTM with a ConvLSTM operating directly on CNN "
-             "spatial feature maps, weaving recurrence throughout the model instead "
-             "of applying it only after full pooling (model improvement). Mutually "
-             "exclusive with --bidirectional/--use_attention.",
-    )
-    parser.add_argument(
-        "-clsh", "--conv_lstm_hidden_channels", type=int, default=128,
-        help="Number of hidden channels in the ConvLSTM cell (only used with "
-             "--use_conv_lstm)",
-    )
-    parser.add_argument(
-        "-fbu", "--freeze_backbone_until", type=int, default=None,
-        help="Number of trailing ResNet child modules to keep trainable; earlier "
-             "layers are frozen (model improvement, partial fine-tuning)",
-    )
-    parser.add_argument(
-        "-fcd", "--flow_cache_dir", type=str, default="./flow_cache",
-        help="PERFORMANCE IMPROVEMENT: directory to cache computed optical flow "
-             "(only used with --model_type i3d). Flow is deterministic per clip, "
-             "so caching it avoids recomputing it from scratch every epoch.",
-    )
-
-    parser.add_argument(
-        "-m", "--mode", type=str, default="train", required=True, help="'train' or 'eval'"
-    )
-    parser.add_argument("-bs", "--batch_size", type=int, required=True, help="Mini-batch size")
-    parser.add_argument("-d", "--dropout", type=float, default=0.1, help="Dropout rate")
-    parser.add_argument("-lr", "--learning_rate", type=float, default=3e-5, help="Learning rate")
-    parser.add_argument(
-        "-blrf", "--backbone_lr_factor", type=float, default=1.0,
-        help="Multiplier applied to --learning_rate for backbone (CNN) parameters "
-             "only, e.g. 0.1 gives the backbone 1/10th the LR of the newly "
-             "initialized head (model improvement -- prevents an LR tuned for "
-             "fresh layers from being too aggressive for pretrained weights)",
-    )
-    parser.add_argument("-ne", "--n_epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument(
-        "-lrp", "--lr_patience", type=int, default=5,
-        help="Epochs with no val loss improvement before the LR scheduler reduces "
-             "the learning rate (ReduceLROnPlateau patience)",
-    )
-
-    parser.add_argument(
-        "-wb", "--wandb_project", type=str, default="hmdb51-lrcn", help="W&B project name"
-    )
-    parser.add_argument("-run", "--run_name", type=str, default=None, help="W&B run name")
+    parser.add_argument('-m', '--mode', type=str, default='train', required=True,
+                         help="Either 'train', 'eval', or 'preprocess_flow'")
+    parser.add_argument('-bs', '--batch_size', type=int, required=True, help='Mini-batch size')
+    parser.add_argument('-d', '--dropout', type=float, default=0.1,
+                         help='Dropout rate for regularization')
+    parser.add_argument('-lr', '--learning_rate', type=float, default=3e-5,
+                         help='Learning rate for model training')
+    parser.add_argument('-ne', '--n_epochs', type=int, default=30,
+                         help='Number of training epochs')
 
     return parser.parse_args()
 
-# pylint: disable=too-many-locals,too-many-statements
+
+def build_model(args):
+    """
+    Instantiate the model specified by args: TwoStreamI3D for two-stream mode, otherwise the
+    LRCN baseline.
+
+    Args:
+        args (argparse.Namespace): Parsed command-line arguments.
+
+    Returns:
+        torch.nn.Module: The instantiated (untrained) model.
+    """
+    if args.model_type == 'i3d_two_stream':
+        return TwoStreamI3D(n_classes=args.n_classes, pretrained=args.pretrained)
+    return LRCN(hidden_size=args.rnn_hidden_size, n_layers=args.rnn_n_layers,
+                dropout_rate=args.dropout, n_classes=args.n_classes,
+                pretrained=args.pretrained, cnn_model=args.cnn_backbone)
+
+
+def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_transforms):
+    """
+    Build the training and validation DataLoaders, branching on model_type since two-stream
+    I3D needs matching RGB/flow clips while the LRCN/3DCNN path needs a single RGB clip.
+
+    Returns:
+        dict: Dictionary with 'train' and 'val' DataLoaders.
+    """
+    if args.model_type == 'i3d_two_stream':
+        tr_dataset = TwoStreamVideoDataset(tr_split, args.flow_dir, args.fr_per_vid,
+                                            tr_transforms, tr_transforms)
+        val_dataset = TwoStreamVideoDataset(val_split, args.flow_dir, args.fr_per_vid,
+                                             val_ts_transforms, val_ts_transforms)
+        train_dl = DataLoader(tr_dataset, batch_size=args.batch_size, shuffle=True,
+                               collate_fn=collate_fn_two_stream)
+        val_dl = DataLoader(val_dataset, batch_size=2 * args.batch_size, shuffle=False,
+                             collate_fn=collate_fn_two_stream)
+        return {'train': train_dl, 'val': val_dl}
+
+    tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms)
+    val_dataset = VideoDataset(val_split, args.fr_per_vid, val_ts_transforms)
+    return train_val_dloaders(tr_dataset, val_dataset, args.batch_size, args.model_type)
+
+
+def run_train(args, model, device, tr_transforms, val_ts_transforms):
+    """
+    Train mode: load and split the dataset, save the splits, build dataloaders, and run the
+    training loop.
+    """
+    vid_dataset, _ = load_dataset(args.frame_dir)
+    tr_split, val_split, ts_split = dataset_split(vid_dataset, args.train_size, args.test_size)
+
+    # Save the splits for reproducibility and later use in evaluation
+    splits = {'train': np.array(tr_split), 'val': np.array(val_split), 'test': np.array(ts_split)}
+    np.save('./splits.npy', splits)
+
+    dataloaders = build_train_dataloaders(args, tr_split, val_split,
+                                           tr_transforms, val_ts_transforms)
+
+    # TwoStreamI3D.forward returns log-probabilities (fusion happens in probability space), so
+    # it pairs with NLLLoss rather than CrossEntropyLoss (which expects raw logits).
+    if args.model_type == 'i3d_two_stream':
+        loss_func = nn.NLLLoss(reduction='sum')
+    else:
+        loss_func = nn.CrossEntropyLoss(reduction='sum')
+
+    opt = optim.Adam(model.parameters(), lr=args.learning_rate)
+    lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
+    os.makedirs("./models", exist_ok=True)
+
+    model.to(device)
+    train(dataloaders, model, loss_func, opt, lr_scheduler, device, './models', args.n_epochs)
+
+
+def run_eval(args, model, device, val_ts_transforms):
+    """
+    Eval mode: load the saved test split, build a test dataloader, load the checkpoint, and
+    report overall test accuracy.
+    """
+    splits = np.load('./splits.npy', allow_pickle=True)
+    ts_split = splits.item()['test']
+    ts_split = [(sample[0], int(sample[1])) for sample in ts_split]
+
+    if args.model_type == 'i3d_two_stream':
+        ts_dataset = TwoStreamVideoDataset(ts_split, args.flow_dir, args.fr_per_vid,
+                                            val_ts_transforms, val_ts_transforms)
+        dataloaders = {'test': DataLoader(ts_dataset, batch_size=2 * args.batch_size,
+                                           shuffle=False, collate_fn=collate_fn_two_stream)}
+    else:
+        ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms)
+        dataloaders = test_dloaders(ts_dataset, args.batch_size, args.model_type)
+
+    model.load_state_dict(torch.load(args.ckpt))
+    model.to(device)
+    _, _, accuracy = test(model, dataloaders['test'], device)
+
+    print(f'The overall test accuracy is {100 * accuracy:.4f}%.')
+    # For a detailed per-class breakdown, capture (targets, outputs) from test() above and pass
+    # them to get_test_report / get_confusion_matrix from test.py.
+
+
+def run_preprocess_flow(args):
+    """
+    Preprocess-flow mode: for every video already extracted as RGB frames under args.frame_dir,
+    compute optical flow between its frames and write the result to args.flow_dir, mirroring
+    the class/video subfolder structure so TwoStreamVideoDataset can pair the two directories up.
+    This is a one-off step to run before training/evaluating model_type=i3d_two_stream.
+    """
+    for vid_cat in sorted(os.listdir(args.frame_dir)):
+        cat_path = os.path.join(args.frame_dir, vid_cat)
+        if not os.path.isdir(cat_path):
+            continue
+        for vid in tqdm(sorted(os.listdir(cat_path)), desc=vid_cat):
+            vid_path = os.path.join(cat_path, vid)
+            fr_paths = sorted(glob.glob(vid_path + '/*.jpg'))
+            if len(fr_paths) < 2:
+                continue
+
+            frames = [np.array(Image.open(p).convert('RGB')) for p in fr_paths]
+            flow_frames = compute_flow_frames(frames)
+
+            out_dir = os.path.join(args.flow_dir, vid_cat, vid)
+            os.makedirs(out_dir, exist_ok=True)
+            store_frames(flow_frames, out_dir)
+
+
 def main(args):
     """
-    Main function to execute training or evaluation based on the parsed command-line arguments.
-
-    For training:
-        - Loads the dataset from the specified frame directory.
-        - Splits the dataset into training, validation, and test sets.
-        - Saves the splits for later use.
-        - Creates the training and validation DataLoaders.
-        - Initializes the model (LRCN) with specified hyperparameters.
-        - Defines the loss function, optimizer, and learning rate scheduler.
-        - Runs the training loop and saves the best model weights.
-
-    For evaluation:
-        - Loads the saved dataset splits.
-        - Creates the test DataLoader.
-        - Loads the trained model checkpoint.
-        - Evaluates the model on the test set and prints the overall test accuracy.
+    Main function to execute training, evaluation, or flow preprocessing based on the parsed
+    command-line arguments.
 
     Args:
         args (argparse.Namespace): Parsed command-line arguments.
     """
-    # Dataset parameters
-    frame_dir = args.frame_dir
-    tr_size = args.train_size
-    ts_size = args.test_size
-    fr_per_vid = args.fr_per_vid
-    n_classes = args.n_classes
+    if args.mode == 'preprocess_flow':
+        # Flow preprocessing needs no model/transforms, just frame_dir -> flow_dir.
+        run_preprocess_flow(args)
+        return
 
-    # Model parameters
-    model_type = args.model_type
-    rnn_hidden_size = args.rnn_hidden_size
-    rnn_n_layers = args.rnn_n_layers
-    dropout = args.dropout
-    pretrained = args.pretrained
-    cnn_backbone = args.cnn_backbone
-
-    # Training parameters
-    mode = args.mode
-    batch_size = args.batch_size
-    n_epochs = args.n_epochs
-    learning_rate = args.learning_rate
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    wandb.init(
-        project=args.wandb_project,
-        name=args.run_name,
-        config=vars(args),
-    )
     # Load transformation statistics and create data augmentation transforms
-    # Model improvement: 'i3d' (two-stream RGB+flow) reuses the '3dcnn' resolution/
-    # normalization stats for its RGB stream -- optical flow normalization is
-    # handled separately inside VideoDataset/_compute_flow_stack, not through
-    # this transform pipeline, so no separate branch is needed here.
-    transform_model_type = '3dcnn' if model_type == 'i3d' else model_type
-    h, w, mean, std = transform_stats(transform_model_type)
+    h, w, mean, std = transform_stats(args.model_type)
     tr_transforms, val_ts_transforms = compose_data_transforms(h, w, mean, std)
 
-    # Initialize the model (LRCN)
-    # FIX: --model_type was documented and accepted as a CLI arg (including a
-    # '3dcnn' option) but never actually used to select which model gets built --
-    # LRCN was constructed unconditionally regardless of --model_type. Model
-    # improvement: R3DClassifier (Kinetics-400-pretrained 3D CNN) is now wired up
-    # as a real alternative when --model_type 3dcnn is passed. Model improvement:
-    # TwoStreamR3D (RGB + optical flow, in the spirit of I3D's two-stream design)
-    # is wired up as a further alternative when --model_type i3d is passed.
-    if model_type == '3dcnn':
-        model = R3DClassifier(
-            n_classes=n_classes, pretrained=pretrained,
-            freeze_backbone_until=args.freeze_backbone_until,
-        )
-    elif model_type == 'i3d':
-        model = TwoStreamR3D(
-            n_classes=n_classes, pretrained=pretrained,
-            freeze_backbone_until=args.freeze_backbone_until,
-        )
+    model = build_model(args)
+
+    if args.mode == 'train':
+        run_train(args, model, device, tr_transforms, val_ts_transforms)
+    elif args.mode == 'eval':
+        run_eval(args, model, device, val_ts_transforms)
     else:
-        model = LRCN(
-            hidden_size=rnn_hidden_size, n_layers=rnn_n_layers, dropout_rate=dropout,
-            n_classes=n_classes, pretrained=pretrained, cnn_model=cnn_backbone,
-            freeze_backbone_until=args.freeze_backbone_until,
-            bidirectional=args.bidirectional,
-            use_attention=args.use_attention,
-            use_conv_lstm=args.use_conv_lstm,
-            conv_lstm_hidden_channels=args.conv_lstm_hidden_channels,
-        )
+        raise ValueError("The mode argument must be 'train', 'eval', or 'preprocess_flow'.")
 
-    if mode == 'train':
-        # FIX: load_dataset/dataset_split now return group keys derived from
-        # source-video identity, and dataset_split performs a group-aware stratified
-        # split so clips from the same source video can never leak across splits.
-        # Load dataset and split into train/validation/test
-        vid_paths, vid_labels, vid_groups, label_dict = load_dataset(frame_dir)
-        tr_split, val_split, ts_split = dataset_split(
-            vid_paths, vid_labels, vid_groups, tr_size, ts_size
-        )
-
-        # Save the splits for reproducibility and later use in evaluation
-        splits = {'train': np.array(tr_split),
-                  'val': np.array(val_split),
-                  'test': np.array(ts_split)}
-        np.save('./splits.npy', splits)
-
-        # Create PyTorch Datasets and DataLoaders for train and validation
-        # Model improvement: compute_flow=True (only for --model_type i3d) makes
-        # VideoDataset also compute and concatenate optical flow channels onto
-        # each RGB frame -- see video_datasets.VideoDataset/_compute_flow_stack.
-        tr_dataset = VideoDataset(
-            tr_split, fr_per_vid, tr_transforms,
-            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
-            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
-        )
-        val_dataset = VideoDataset(
-            val_split, fr_per_vid, val_ts_transforms,
-            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
-            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
-        )
-        dataloaders = train_val_dloaders(tr_dataset, val_dataset, batch_size, model_type)
-
-        # Define the loss function, optimizer, and learning rate scheduler
-        # Model improvement: label smoothing softens the target distribution
-        # (instead of a hard one-hot target), discouraging the model from
-        # becoming overconfident on training examples it has memorized.
-        loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
-        # Model improvement: weight decay for regularization.
-        # Model improvement: differential learning rates. A backbone_lr_factor < 1.0
-        # gives the pretrained CNN backbone a lower LR than the freshly-initialized
-        # head (LSTM/ConvLSTM/attention/fc), preventing an LR tuned for the fresh
-        # layers from being too aggressive for already-good pretrained weights.
-        # NOTE: when use_conv_lstm=True, model.spatial_extractor and model.base_model
-        # reference the *same* underlying parameter tensors (both wrap the backbone's
-        # conv layers), so parameters are deduped by identity to avoid the same
-        # tensor being assigned to two optimizer param groups at once.
-        backbone_param_ids = {id(p) for p in model.base_model.parameters()}
-        seen_ids, backbone_params, head_params = set(), [], []
-        for param in model.parameters():
-            if not param.requires_grad or id(param) in seen_ids:
-                continue
-            seen_ids.add(id(param))
-            if id(param) in backbone_param_ids:
-                backbone_params.append(param)
-            else:
-                head_params.append(param)
-        opt = optim.Adam(
-            [
-                {"params": backbone_params, "lr": learning_rate * args.backbone_lr_factor},
-                {"params": head_params, "lr": learning_rate},
-            ],
-            weight_decay=1e-4,
-        )
-        # FIX: verbose=1 is invalid/deprecated for ReduceLROnPlateau in recent
-        # PyTorch versions (expects bool, and is removed entirely in newest versions).
-        lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=args.lr_patience)
-        os.makedirs("./models", exist_ok=True)
-        optim_model_dir = './models'
-
-        # Main training procedure
-        model.to(device)
-        model, _loss_hist, _acc_hist = train(
-            dataloaders, model, loss_func, opt, lr_scheduler, device, optim_model_dir, n_epochs
-        )
-        # Evaluate on held-out test set immediately after training and log to W&B.
-        ts_dataset = VideoDataset(
-            ts_split, fr_per_vid, val_ts_transforms,
-            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
-            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
-        )
-        test_dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
-        targets, outputs, test_accuracy = evaluate(model, test_dataloaders["test"], device)
-        print(f"Final test accuracy: {100 * test_accuracy:.4f}%")
-        wandb.summary["test_accuracy"] = test_accuracy
-
-        all_cats = sorted(label_dict, key=label_dict.get)
-        report = get_test_report(targets, outputs, all_cats)
-        wandb.log({"test/accuracy": test_accuracy})
-        wandb.summary["classification_report"] = report
-        # FIX: main() must return consistently across branches (pylint
-        # inconsistent-return-statements) -- the eval branch returns a confusion
-        # matrix, so the train branch explicitly returns None here.
-        return None
-
-    if mode == 'eval':
-        # Load saved dataset splits
-        splits = np.load('./splits.npy', allow_pickle=True)
-        ts_split = splits.item()['test']
-        ts_split = [(sample[0], int(sample[1])) for sample in ts_split]
-
-        # Create PyTorch Dataset and DataLoader for the test set
-        ts_dataset = VideoDataset(
-            ts_split, fr_per_vid, val_ts_transforms,
-            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
-            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
-        )
-        dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
-
-        # Load the trained model checkpoint
-        model.load_state_dict(torch.load(args.ckpt))
-        model.to(device)
-        targets, outputs, accuracy = evaluate(model, dataloaders["test"], device)
-
-        print(f'The overall test accuracy is {100 * accuracy:.4f}%.')
-        # Optionally, generate a detailed test report or confusion matrix:
-        # print(get_test_report(targets, outputs, all_cats))
-        # print(get_confusion_matrix(targets, outputs, labels_dict, all_cats))
-        wandb.summary["test_accuracy"] = accuracy
-
-        all_cats = sorted(label_dict, key=label_dict.get)
-        report = get_test_report(targets, outputs, all_cats)
-        conf_mat = get_confusion_matrix(targets, outputs, label_dict, all_cats)
-        wandb.summary["classification_report"] = report
-        print(report)
-        return conf_mat
-
-    raise ValueError('The mode argument must be either "train" or "eval".')
 
 if __name__ == "__main__":
-    main(args_parser())
+    cli_args = args_parser()
+    main(cli_args)
