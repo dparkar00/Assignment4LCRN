@@ -38,6 +38,7 @@ class I3DStream(nn.Module):
         # Replace the Kinetics-400 head (400 classes) with one sized for this task.
         in_features = self.backbone.blocks[-1].proj.in_features
         self.backbone.blocks[-1].proj = nn.Linear(in_features, n_classes)
+        self._backbone_frozen = False
 
     def forward(self, x):
         """
@@ -63,14 +64,34 @@ class I3DStream(nn.Module):
         return [p for p in self.backbone.parameters() if id(p) not in head_ids]
 
     def freeze_backbone(self):
-        """Freeze the pretrained trunk (requires_grad=False), leaving the head trainable."""
+        """Freeze the pretrained trunk: requires_grad=False stops weight updates, and marking
+        _backbone_frozen makes train() (below) keep its BatchNorm layers in eval mode too --
+        requires_grad alone does not stop BatchNorm from drifting running_mean/running_var
+        during a forward pass while the module is in training mode."""
+        self._backbone_frozen = True
         for p in self.backbone_parameters():
             p.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Unfreeze the pretrained trunk so the whole stream fine-tunes again."""
+        """Unfreeze the pretrained trunk so the whole stream (weights and BatchNorm stats)
+        fine-tunes again."""
+        self._backbone_frozen = False
         for p in self.backbone.parameters():
             p.requires_grad = True
+
+    def train(self, mode=True):
+        """Override so a frozen backbone's BatchNorm layers stay in eval mode even when the
+        rest of the model is asked to train. A one-time module.eval() call inside
+        freeze_backbone() would not be durable: the training loop calls model.train() at the
+        start of every epoch, which would silently put those BatchNorm layers back into
+        training mode (and let their running stats keep drifting) unless this is reapplied
+        every time train() is called, which is exactly what this override does."""
+        super().train(mode)
+        if self._backbone_frozen:
+            for module in self.backbone.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.eval()
+        return self
 
 
 class TwoStreamI3D(nn.Module):
@@ -212,6 +233,8 @@ class LRCN(nn.Module):
         # Final fully-connected layer to produce logits for each class.
         self.fc = nn.Linear(hidden_size, n_classes)
 
+        self._backbone_frozen = False
+
     def forward(self, x):
         """
         Forward pass for the LRCN model.
@@ -254,11 +277,28 @@ class LRCN(nn.Module):
         return list(self.rnn.parameters()) + list(self.fc.parameters())
 
     def freeze_backbone(self):
-        """Freeze the pretrained CNN backbone, leaving the LSTM/fc head trainable."""
+        """Freeze the pretrained CNN backbone: requires_grad=False stops weight updates, and
+        marking _backbone_frozen makes train() (below) keep its BatchNorm layers in eval mode
+        too -- requires_grad alone does not stop BatchNorm from drifting running_mean/
+        running_var during a forward pass while the module is in training mode."""
+        self._backbone_frozen = True
         for p in self.backbone_parameters():
             p.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Unfreeze the pretrained CNN backbone so the whole model fine-tunes again."""
+        """Unfreeze the pretrained CNN backbone so the whole model (weights and BatchNorm
+        stats) fine-tunes again."""
+        self._backbone_frozen = False
         for p in self.backbone_parameters():
             p.requires_grad = True
+
+    def train(self, mode=True):
+        """Override so a frozen backbone's BatchNorm layers stay in eval mode even when the
+        rest of the model is asked to train -- see I3DStream.train() above for why a one-time
+        eval() call inside freeze_backbone() would not be durable across epochs."""
+        super().train(mode)
+        if self._backbone_frozen:
+            for module in self.base_model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.eval()
+        return self
