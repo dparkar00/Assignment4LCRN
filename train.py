@@ -57,6 +57,10 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
     best_val_acc = 0.0
     best_model_path = os.path.join(optim_model_wts_dir, "best_model_wts.pt")
 
+    # Enable mixed precision training for faster performance on compatible GPUs
+    use_amp = torch.cuda.is_available() and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
     for epoch in range(n_epochs):
         current_lr = get_learning_rate(optimizer)
         print(f'Epoch {epoch+1}/{n_epochs}; Current learning rate {current_lr}')
@@ -64,7 +68,7 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         # Training phase
         model.train()
         train_loss, train_accuracy = get_epoch_loss(
-            model, criterion, dataloaders['train'], device, optimizer
+            model, criterion, dataloaders['train'], device, optimizer, scaler
         )
         loss_hist['train'].append(train_loss)
         acc_hist['train'].append(train_accuracy)
@@ -72,7 +76,9 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         # Validation phase
         model.eval()
         with torch.no_grad():
-            val_loss, val_accuracy = get_epoch_loss(model, criterion, dataloaders['val'], device)
+            val_loss, val_accuracy = get_epoch_loss(
+                model, criterion, dataloaders['val'], device, None, None
+            )
         if val_accuracy > best_val_acc:
             best_val_acc = val_accuracy
             best_model_wts = copy.deepcopy(model.state_dict())
@@ -138,7 +144,7 @@ def batch_correct_preds(output, target):
     correct_preds = pred.eq(target.view_as(pred)).sum().item()
     return correct_preds
 
-def get_batch_loss(model, criterion, output, target, optimizer=None):
+def get_batch_loss(model, criterion, output, target, optimizer=None, scaler=None):
     """
     Compute the loss for a mini-batch and perform backpropagation (if optimizer is provided).
 
@@ -149,6 +155,7 @@ def get_batch_loss(model, criterion, output, target, optimizer=None):
         target (torch.Tensor): True labels for the mini-batch.
         optimizer (torch.optim.Optimizer, optional): Optimizer to update model weights.
             If None, no backpropagation is performed.
+        scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed precision.
 
     Returns:
         tuple: (loss_value, n_batch_correct_preds)
@@ -160,13 +167,20 @@ def get_batch_loss(model, criterion, output, target, optimizer=None):
         n_batch_correct_preds = batch_correct_preds(output, target)
     if optimizer:
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
     return loss.item(), n_batch_correct_preds
 
 # pylint: disable=too-many-locals
-def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
+def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=None):
     """
     Compute the average loss and overall accuracy for an epoch.
 
@@ -180,6 +194,7 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
         device (torch.device): Device (CPU or GPU) on which to perform computations.
         optimizer (torch.optim.Optimizer, optional): If provided, used to update model
             weights during training.
+        scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed precision.
 
     Returns:
         tuple: (loss, accuracy)
@@ -194,10 +209,19 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
         if x_batch is None:
             continue
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-        output = model(x_batch, lengths=lengths)
-        batch_loss, n_batch_correct_preds = get_batch_loss(
-            model, criterion, output, y_batch, optimizer
-        )
+
+        # Use mixed precision for forward pass if scaler is available
+        if scaler is not None and optimizer is not None:
+            with torch.cuda.amp.autocast():
+                output = model(x_batch, lengths=lengths)
+                batch_loss, n_batch_correct_preds = get_batch_loss(
+                    model, criterion, output, y_batch, optimizer, scaler
+                )
+        else:
+            output = model(x_batch, lengths=lengths)
+            batch_loss, n_batch_correct_preds = get_batch_loss(
+                model, criterion, output, y_batch, optimizer, None
+            )
 
         running_loss += batch_loss
         running_total_correct_preds += n_batch_correct_preds

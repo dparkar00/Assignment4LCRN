@@ -1,0 +1,27 @@
+[MASTER]
+# Ignore OpenCV's C++ extension members
+generated-members=cv2.*
+
+[MESSAGES CONTROL]
+# Disable specific warnings
+disable=
+    no-member,
+    duplicate-code,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-instance-attributes,
+    too-few-public-methods,
+    unused-argument
+
+[FORMAT]
+# Maximum line length
+max-line-length=100
+
+[BASIC]
+# Good variable names
+good-names=i,j,k,ex,Run,_,idx,x,y,id
+
+[TYPECHECK]
+# Ignore OpenCV members
+generated-members=cv2.*

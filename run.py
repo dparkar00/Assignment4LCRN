@@ -256,6 +256,9 @@ def main(args):
                   'test': np.array(ts_split)}
         np.save('./splits.npy', splits)
 
+        # Save label_dict for eval mode
+        np.save('./label_dict.npy', label_dict)
+
         # Create PyTorch Datasets and DataLoaders for train and validation
         tr_dataset = VideoDataset(tr_split, fr_per_vid, tr_transforms)
         val_dataset = VideoDataset(val_split, fr_per_vid, val_ts_transforms)
@@ -265,7 +268,7 @@ def main(args):
         # Model improvement: label smoothing softens the target distribution
         # (instead of a hard one-hot target), discouraging the model from
         # becoming overconfident on training examples it has memorized.
-        loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
+        loss_func = nn.CrossEntropyLoss(reduction='mean', label_smoothing=0.1)
         # Model improvement: weight decay for regularization.
         # Model improvement: differential learning rates. A backbone_lr_factor < 1.0
         # gives the pretrained CNN backbone a lower LR than the freshly-initialized
@@ -322,6 +325,7 @@ def main(args):
     if mode == 'eval':
         # Load saved dataset splits
         splits = np.load('./splits.npy', allow_pickle=True)
+        label_dict = np.load('./label_dict.npy', allow_pickle=True).item()
         ts_split = splits.item()['test']
         ts_split = [(sample[0], int(sample[1])) for sample in ts_split]
 
