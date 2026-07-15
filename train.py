@@ -73,7 +73,7 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
 
     # Mixed-precision training: only enabled on CUDA, where tensor cores give a real speedup;
     # on CPU it has no benefit and GradScaler would just add overhead, so it's a no-op there.
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
     for epoch in range(n_epochs):
         if freeze_backbone_until > 0 and epoch == freeze_backbone_until:

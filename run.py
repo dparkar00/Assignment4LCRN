@@ -112,6 +112,9 @@ def args_parser():
                          help='Dropout rate for regularization')
     parser.add_argument('-lr', '--learning_rate', type=float, default=3e-5,
                          help='Learning rate for model training')
+    parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4,
+                         help='Weight decay (L2 regularization) for AdamW, applied to both '
+                              'backbone and head. 0 disables it.')
     parser.add_argument('-ne', '--n_epochs', type=int, default=30,
                          help='Number of training epochs')
 
@@ -196,10 +199,10 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
     else:
         loss_func = nn.CrossEntropyLoss(reduction='sum')
 
-    opt = optim.Adam([
+    opt = optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.learning_rate * args.backbone_lr_factor},
         {'params': model.head_parameters(), 'lr': args.learning_rate},
-    ])
+    ], weight_decay=args.weight_decay)
     lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
     os.makedirs("./models", exist_ok=True)
 
