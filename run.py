@@ -29,6 +29,7 @@ import argparse
 
 import numpy as np
 import torch
+import wandb
 from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -70,6 +71,9 @@ def args_parser():
         -d/--dropout: Dropout rate for regularization (default 0.1).
         -lr/--learning_rate: Learning rate for training (default 3e-5).
         -ne/--n_epochs: Number of training epochs (default 30).
+        -wp/--wandb_project: Weights & Biases project name (default 'hmdb51-video-classification').
+        -rn/--run_name: Weights & Biases run name (optional; wandb auto-generates one if omitted).
+        --no_wandb: Disable Weights & Biases logging entirely (enabled by default in train mode).
     """
     parser = argparse.ArgumentParser(description='Video Classification Training')
 
@@ -105,6 +109,13 @@ def args_parser():
                          help='Learning rate for model training')
     parser.add_argument('-ne', '--n_epochs', type=int, default=30,
                          help='Number of training epochs')
+
+    parser.add_argument('-wp', '--wandb_project', default='hmdb51-video-classification',
+                         help='Weights & Biases project name')
+    parser.add_argument('-rn', '--run_name', default=None,
+                         help='Weights & Biases run name (optional)')
+    parser.add_argument('--no_wandb', action='store_true',
+                         help='Disable Weights & Biases logging')
 
     return parser.parse_args()
 
@@ -154,7 +165,7 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
 def run_train(args, model, device, tr_transforms, val_ts_transforms):
     """
     Train mode: load and split the dataset, save the splits, build dataloaders, and run the
-    training loop.
+    training loop, logging metrics to Weights & Biases unless --no_wandb is set.
     """
     vid_dataset, _ = load_dataset(args.frame_dir)
     tr_split, val_split, ts_split = dataset_split(vid_dataset, args.train_size, args.test_size)
@@ -177,8 +188,16 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
     lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
     os.makedirs("./models", exist_ok=True)
 
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
+
     model.to(device)
-    train(dataloaders, model, loss_func, opt, lr_scheduler, device, './models', args.n_epochs)
+    train(dataloaders, model, loss_func, opt, lr_scheduler, device, './models',
+          args.n_epochs, use_wandb=use_wandb)
+
+    if use_wandb:
+        wandb.finish()
 
 
 def run_eval(args, model, device, val_ts_transforms):

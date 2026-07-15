@@ -18,6 +18,7 @@ import os
 import copy
 from tqdm import tqdm
 import torch
+import wandb
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -25,7 +26,7 @@ import torch
 # optimizer, scheduler, device, checkpoint dir, epoch count) is independently meaningful and
 # bundling them into a config object would obscure the function's contract more than it helps.
 def train(dataloaders, model, criterion, optimizer, scheduler, device,
-          optim_model_wts_dir, n_epochs=30):
+          optim_model_wts_dir, n_epochs=30, use_wandb=False):
     """
     Train and validate the model over a given number of epochs.
     
@@ -44,6 +45,9 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         device (torch.device): Device (CPU or GPU) on which to perform training.
         optim_model_wts_dir (str): Directory to save the best model weights.
         n_epochs (int, optional): Number of training epochs. Default is 30.
+        use_wandb (bool, optional): If True, log per-epoch metrics and the best checkpoint to
+                                     the currently active wandb run (the caller is responsible
+                                     for wandb.init()/wandb.finish()). Default is False.
 
     Returns:
         tuple: (model, loss_hist, acc_hist)
@@ -81,6 +85,8 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
             best_model_path = os.path.join(optim_model_wts_dir, best_model_name)
             torch.save(best_model_wts, best_model_path)
             print(f'Best model weights are updated at epoch {epoch+1}!')
+            if use_wandb:
+                wandb.save(best_model_path)
         loss_hist['val'].append(val_loss)
         acc_hist['val'].append(val_accuracy)
 
@@ -89,6 +95,17 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         if current_lr != get_learning_rate(optimizer):
             print('Loading best model weights!')
             model.load_state_dict(best_model_wts)
+
+        if use_wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_accuracy': train_accuracy,
+                'val_accuracy': val_accuracy,
+                'best_val_accuracy': best_val_acc,
+                'learning_rate': current_lr,
+            })
 
         print(f"train loss: {train_loss:.6f}, val loss: {val_loss:.6f}, "
               f"accuracy: {100*val_accuracy:.2f}")
