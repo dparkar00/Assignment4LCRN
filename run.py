@@ -233,6 +233,10 @@ def run_preprocess_flow(args):
     compute optical flow between its frames and write the result to args.flow_dir, mirroring
     the class/video subfolder structure so TwoStreamVideoDataset can pair the two directories up.
     This is a one-off step to run before training/evaluating model_type=i3d_two_stream.
+
+    Idempotent/resumable: a video is skipped if its flow output directory already contains the
+    same number of frames as its RGB input, so re-running this (in the same session, or after a
+    session restart) does not redo work that already finished.
     """
     for vid_cat in sorted(os.listdir(args.frame_dir)):
         cat_path = os.path.join(args.frame_dir, vid_cat)
@@ -244,10 +248,16 @@ def run_preprocess_flow(args):
             if len(fr_paths) < 2:
                 continue
 
+            out_dir = os.path.join(args.flow_dir, vid_cat, vid)
+            existing = glob.glob(out_dir + '/*.jpg')
+            if len(existing) == len(fr_paths):
+                # Flow already computed for this video (same frame count as the RGB clip) --
+                # skip so re-running this step doesn't redo already-finished work.
+                continue
+
             frames = [np.array(Image.open(p).convert('RGB')) for p in fr_paths]
             flow_frames = compute_flow_frames(frames)
 
-            out_dir = os.path.join(args.flow_dir, vid_cat, vid)
             os.makedirs(out_dir, exist_ok=True)
             store_frames(flow_frames, out_dir)
 
