@@ -187,6 +187,16 @@ def collate_fn_r3d_18(batch):
     with no frames, stacks the video frame tensors, transposes the tensor dimensions as needed,
     and stacks the labels.
 
+    BUG FIX: the original implementation called torch.stack directly on imgs_batch,
+    which requires every clip to have exactly the same number of frames (T). But
+    VideoDataset can return fewer than fr_per_vid frames if a clip's source
+    directory has fewer JPEGs than requested, or after a corrupted frame is
+    skipped -- torch.stack then raises a RuntimeError on any batch containing
+    clips of different lengths. Clips are now padded to the longest clip in the
+    batch first (zero-padding extra frames), the same variable-length handling
+    collate_fn_rnn already applies for the LSTM path. R3D-18 tolerates this fine
+    since it pools over the time dimension at the end regardless of its length.
+
     Args:
         batch (list): List of samples, each as (video_frames, label).
 
@@ -202,8 +212,8 @@ def collate_fn_r3d_18(batch):
     imgs_batch, label_batch = list(zip(*batch))
     imgs_batch = [imgs for imgs in imgs_batch if len(imgs) > 0]
     label_batch = [torch.tensor(l) for l, imgs in zip(label_batch, imgs_batch) if len(imgs) > 0]
-    imgs_tensor = torch.stack(imgs_batch)
-    imgs_tensor = torch.transpose(imgs_tensor, 2, 1)
+    padded_imgs = pad_sequence(imgs_batch, batch_first=True)  # (B, max_T, C, H, W)
+    imgs_tensor = torch.transpose(padded_imgs, 2, 1)  # -> (B, C, max_T, H, W) for R3D-18
     labels_tensor = torch.stack(label_batch)
     return imgs_tensor, labels_tensor, None
 
