@@ -181,6 +181,7 @@ def store_frames(frames, store_path):
         None
     """
     for idx, frame in enumerate(frames):
+        print("processing")
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         path_to_frame = os.path.join(store_path, f"frame{idx}.jpg")
         cv2.imwrite(path_to_frame, frame)
@@ -244,9 +245,9 @@ def compose_data_transforms(height, width, mean, std):
             - val_test_transforms: Composed transforms for the validation/test set.
     """
     train_transforms = transforms.Compose([
-        transforms.Resize((height, width)),
+        transforms.RandomResizedCrop((height, width), scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])

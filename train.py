@@ -82,7 +82,9 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
                   f'(was frozen for the first {freeze_backbone_until} epochs).')
 
         current_lr = get_learning_rate(optimizer)
-        print(f'Epoch {epoch+1}/{n_epochs}; Current learning rate {current_lr}')
+        all_lrs = ', '.join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
+        print(f'Epoch {epoch+1}/{n_epochs}; '
+              f'Current learning rate(s) [backbone, head, ...]: {all_lrs}')
 
         # Training phase
         model.train()
