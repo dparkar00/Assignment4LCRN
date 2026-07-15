@@ -37,11 +37,11 @@ def get_frames(vid, n_frames=1):
         - Frames are sampled at uniformly spaced indices.
     """
     frames = []
-    v_cap = cv2.VideoCapture(vid)
+    v_cap = cv2.VideoCapture(vid)  # pylint: disable=no-member
     if not v_cap.isOpened():
         print("Failed to open video:", vid)
         return frames, 0
-    v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))  # pylint: disable=no-member
     if v_len <= 0:
         print("No frames found in video:", vid)
         v_cap.release()
@@ -55,7 +55,7 @@ def get_frames(vid, n_frames=1):
         if not success:
             continue
         if idx in frame_set:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # pylint: disable=no-member
             frames.append(frame)
     v_cap.release()
     return frames, v_len

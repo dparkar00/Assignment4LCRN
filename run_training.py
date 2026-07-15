@@ -51,7 +51,7 @@ import wandb
 
 from video_datasets import VideoDataset, load_dataset, dataset_split
 from utils import transform_stats, compose_data_transforms, compose_dataloaders
-from models import LRCN, R3DClassifier
+from models import LRCN, R3DClassifier, TwoStreamR3D
 from train import train
 
 def str2bool(value):
@@ -105,7 +105,10 @@ def args_parser():
     )
     parser.add_argument("-nc", "--n_classes", type=int, required=True, help="Number of classes")
 
-    parser.add_argument("-mt", "--model_type", default="lrcn", help="3D CNN or LRCN")
+    parser.add_argument(
+        "-mt", "--model_type", default="lrcn",
+        help="Model type: 'lrcn', '3dcnn' (R3D-18), or 'i3d' (two-stream RGB+flow)",
+    )
     parser.add_argument(
         "-cnn", "--cnn_backbone", default="resnet34",
         help="2D CNN backbone - options: resnet18, resnet34, resnet50, resnet101, resnet152",
@@ -220,13 +223,30 @@ def trainer(args):
         vid_paths, vid_labels, vid_groups, tr_size, ts_size
     )
     # Load image transformation statistics and compose data augmentation transforms
-    h, w, mean, std = transform_stats(model_type)
+    # Model improvement: 'i3d' (two-stream RGB+flow) reuses the '3dcnn' resolution/
+    # normalization stats for its RGB stream -- optical flow normalization is
+    # handled separately inside VideoDataset/_compute_flow_stack, not through
+    # this transform pipeline, so no separate branch is needed here.
+    transform_model_type = '3dcnn' if model_type == 'i3d' else model_type
+    h, w, mean, std = transform_stats(transform_model_type)
     tr_transforms, val_ts_transforms = compose_data_transforms(h, w, mean, std)
 
     # Create PyTorch Datasets for each split
-    tr_dataset = VideoDataset(tr_split, fr_per_vid, tr_transforms)
-    val_dataset = VideoDataset(val_split, fr_per_vid, val_ts_transforms)
-    ts_dataset = VideoDataset(ts_split, fr_per_vid, val_ts_transforms)
+    # Model improvement: compute_flow=True (only for --model_type i3d) makes
+    # VideoDataset also compute and concatenate optical flow channels onto
+    # each RGB frame -- see video_datasets.VideoDataset/_compute_flow_stack.
+    tr_dataset = VideoDataset(
+        tr_split, fr_per_vid, tr_transforms,
+        compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+    )
+    val_dataset = VideoDataset(
+        val_split, fr_per_vid, val_ts_transforms,
+        compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+    )
+    ts_dataset = VideoDataset(
+        ts_split, fr_per_vid, val_ts_transforms,
+        compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+    )
 
     # Compose DataLoaders for training, validation, and test using a custom function
     dataloaders = compose_dataloaders(tr_dataset, val_dataset, ts_dataset, batch_size, model_type)
@@ -239,6 +259,11 @@ def trainer(args):
     # as a real alternative when --model_type 3dcnn is passed.
     if model_type == '3dcnn':
         model = R3DClassifier(
+            n_classes=n_classes, pretrained=pretrained,
+            freeze_backbone_until=args.freeze_backbone_until,
+        )
+    elif model_type == 'i3d':
+        model = TwoStreamR3D(
             n_classes=n_classes, pretrained=pretrained,
             freeze_backbone_until=args.freeze_backbone_until,
         )

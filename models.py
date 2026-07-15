@@ -382,3 +382,136 @@ class R3DClassifier(nn.Module):  # pylint: disable=too-few-public-methods
         feats = self.base_model(x)
         out = self.fc(feats)
         return out
+
+
+class TwoStreamR3D(nn.Module):  # pylint: disable=too-few-public-methods
+    """
+    Model improvement: two-stream RGB + optical-flow architecture, in the spirit
+    of I3D (Carreira & Zisserman, 2017). The I3D paper's own ablation shows
+    RGB-only ~74%, Flow-only ~77%, but fusing both streams reaches ~80.9% on
+    HMDB51 -- optical flow gives the model direct access to motion information
+    that a single appearance stream can only infer indirectly from how features
+    change across a sequence of independent frames.
+
+    NOTE: this uses two Kinetics-400-pretrained R3D-18 backbones (one per
+    stream) rather than a from-scratch reimplementation of the exact Inflated-
+    Inception-v1 architecture from the I3D paper. A hand-rolled reimplementation
+    without verified Kinetics-pretrained weights would not benefit from the
+    pretraining that actually drives I3D's published results. The mechanism
+    that matters -- fusing an appearance stream and a motion stream -- is
+    preserved; late fusion of independently pretrained 3D CNN backbones is a
+    standard way to build a two-stream architecture (Simonyan & Zisserman,
+    2014; Carreira & Zisserman, 2017).
+
+    Expects input of shape (batch, 5, time_steps, height, width): channels 0-2
+    are RGB, channels 3-4 are optical flow (x, y components), produced by
+    VideoDataset(compute_flow=True) + collate_fn_r3d_18.
+
+    Args:
+        n_classes (int): Number of output classes.
+        pretrained (bool, optional): Use Kinetics-400 pretrained weights for the
+            RGB stream. Default True. The flow stream's first conv layer can't
+            use the RGB-pretrained weights directly (3 vs 2 input channels), so
+            it's initialized by averaging the RGB stream's pretrained first-
+            layer weights across channels and replicating across the 2 flow
+            channels -- a standard cross-modality initialization trick from the
+            two-stream literature, rather than starting the flow stream from
+            random weights.
+        freeze_backbone_until (int, optional): Applied identically to both streams.
+    """
+    def __init__(self, n_classes, pretrained=True, freeze_backbone_until=None):
+        super().__init__()
+        self.rgb_stream = R3DClassifier(
+            n_classes, pretrained=pretrained, freeze_backbone_until=freeze_backbone_until
+        )
+        self.flow_stream = R3DClassifier(
+            n_classes, pretrained=pretrained, freeze_backbone_until=freeze_backbone_until
+        )
+
+        # NOTE: base_model here is an nn.ModuleList referencing the *same*
+        # underlying backbone parameter tensors already registered under
+        # self.rgb_stream/self.flow_stream -- it exists purely so run.py's
+        # differential-learning-rate code (which reads model.base_model.parameters()
+        # for every model type) works unchanged for TwoStreamR3D too. run.py
+        # already dedupes parameters by identity before building optimizer
+        # groups, so this intentional double-registration is harmless.
+        self.base_model = nn.ModuleList([self.rgb_stream.base_model, self.flow_stream.base_model])
+
+        # BUG FIX: the flow stream's first conv layer must be adapted to accept
+        # 2 input channels (flow x/y) regardless of --pretrained, since the
+        # backbone is built with a standard 3-channel RGB stem either way.
+        # Originally this was only done "if pretrained", so with
+        # --pretrained False the flow stream kept its 3-channel stem and
+        # crashed on the very first forward pass with a real (2-channel) flow
+        # input. Only the *weight initialization source* should depend on
+        # pretrained -- copied from the RGB stream's pretrained weights when
+        # available, or left at PyTorch's default random init otherwise.
+        self._adapt_flow_stream_first_conv(init_from_rgb=pretrained)
+
+    def _adapt_flow_stream_first_conv(self, init_from_rgb):
+        """Replace the flow stream's first conv to accept 2 channels instead of 3."""
+        first_conv = self._find_first_conv(self.flow_stream.base_model)
+        if first_conv is None:
+            return
+        new_conv = nn.Conv3d(
+            2, first_conv.out_channels, kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride, padding=first_conv.padding,
+            bias=first_conv.bias is not None,
+        )
+        if init_from_rgb:
+            # Explicitly source weights from the RGB stream's first conv (not
+            # the flow stream's own, about-to-be-replaced conv) so this is
+            # correct regardless of how each stream happened to be initialized,
+            # matching what the class docstring actually promises.
+            rgb_first_conv = self._find_first_conv(self.rgb_stream.base_model)
+            with torch.no_grad():
+                rgb_weight = rgb_first_conv.weight  # (out_C, 3, kT, kH, kW)
+                flow_weight = rgb_weight.mean(dim=1, keepdim=True).repeat(1, 2, 1, 1, 1)
+                new_conv.weight.copy_(flow_weight)
+                if rgb_first_conv.bias is not None:
+                    new_conv.bias.copy_(rgb_first_conv.bias)
+        self._replace_first_conv(self.flow_stream.base_model, new_conv)
+
+    @staticmethod
+    def _find_first_conv(module):
+        """Recursively find the first nn.Conv3d submodule."""
+        for child in module.children():
+            if isinstance(child, nn.Conv3d):
+                return child
+            found = TwoStreamR3D._find_first_conv(child)
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _replace_first_conv(module, new_conv):
+        """Recursively find and replace the first nn.Conv3d submodule in-place."""
+        for name, child in module.named_children():
+            if isinstance(child, nn.Conv3d):
+                setattr(module, name, new_conv)
+                return True
+            if TwoStreamR3D._replace_first_conv(child, new_conv):
+                return True
+        return False
+
+    def forward(self, x, lengths=None):  # pylint: disable=unused-argument
+        """
+        Args:
+            x (Tensor): (batch, 5, time_steps, height, width) -- channels 0-2
+                RGB, channels 3-4 optical flow (x, y), produced by
+                VideoDataset(compute_flow=True) + collate_fn_r3d_18.
+            lengths: Unused. Accepted only so train.py/test.py can call
+                model(x, lengths=lengths) the same way for every model type.
+
+        Returns:
+            Tensor: Fused class logits, shape (batch_size, n_classes) -- the
+                average of the RGB stream's and flow stream's logits (late
+                fusion), the same score-level fusion strategy used by the
+                original two-stream architectures this design is based on.
+        """
+        rgb = x[:, :3]
+        flow = x[:, 3:5]
+        rgb_logits = self.rgb_stream(rgb)
+        flow_logits = self.flow_stream(flow)
+        fused_logits = (rgb_logits + flow_logits) / 2
+        return fused_logits

@@ -38,7 +38,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import wandb
 
-from models import LRCN, R3DClassifier
+from models import LRCN, R3DClassifier, TwoStreamR3D
 # NOTE: this project's own test.py module shares its name with Python's stdlib
 # "test" package, which is what triggers pylint's import-order warning below for
 # these two lines; the imports still resolve correctly to the local module.
@@ -98,7 +98,10 @@ def args_parser():
     parser.add_argument("-nc", "--n_classes", type=int, required=True, help="Number of classes")
 
     parser.add_argument("-c", "--ckpt", help="Path for loading trained model checkpoints")
-    parser.add_argument("-mt", "--model_type", default="lrcn", help="Model type")
+    parser.add_argument(
+        "-mt", "--model_type", default="lrcn",
+        help="Model type: 'lrcn', '3dcnn' (R3D-18), or 'i3d' (two-stream RGB+flow)",
+    )
     parser.add_argument(
         "-cnn", "--cnn_backbone", default="resnet34",
         help="2D CNN backbone: resnet18, resnet34, resnet50, resnet101, resnet152",
@@ -215,7 +218,12 @@ def main(args):
         config=vars(args),
     )
     # Load transformation statistics and create data augmentation transforms
-    h, w, mean, std = transform_stats(model_type)
+    # Model improvement: 'i3d' (two-stream RGB+flow) reuses the '3dcnn' resolution/
+    # normalization stats for its RGB stream -- optical flow normalization is
+    # handled separately inside VideoDataset/_compute_flow_stack, not through
+    # this transform pipeline, so no separate branch is needed here.
+    transform_model_type = '3dcnn' if model_type == 'i3d' else model_type
+    h, w, mean, std = transform_stats(transform_model_type)
     tr_transforms, val_ts_transforms = compose_data_transforms(h, w, mean, std)
 
     # Initialize the model (LRCN)
@@ -223,9 +231,16 @@ def main(args):
     # '3dcnn' option) but never actually used to select which model gets built --
     # LRCN was constructed unconditionally regardless of --model_type. Model
     # improvement: R3DClassifier (Kinetics-400-pretrained 3D CNN) is now wired up
-    # as a real alternative when --model_type 3dcnn is passed.
+    # as a real alternative when --model_type 3dcnn is passed. Model improvement:
+    # TwoStreamR3D (RGB + optical flow, in the spirit of I3D's two-stream design)
+    # is wired up as a further alternative when --model_type i3d is passed.
     if model_type == '3dcnn':
         model = R3DClassifier(
+            n_classes=n_classes, pretrained=pretrained,
+            freeze_backbone_until=args.freeze_backbone_until,
+        )
+    elif model_type == 'i3d':
+        model = TwoStreamR3D(
             n_classes=n_classes, pretrained=pretrained,
             freeze_backbone_until=args.freeze_backbone_until,
         )
@@ -256,19 +271,25 @@ def main(args):
                   'test': np.array(ts_split)}
         np.save('./splits.npy', splits)
 
-        # Save label_dict for eval mode
-        np.save('./label_dict.npy', label_dict)
-
         # Create PyTorch Datasets and DataLoaders for train and validation
-        tr_dataset = VideoDataset(tr_split, fr_per_vid, tr_transforms)
-        val_dataset = VideoDataset(val_split, fr_per_vid, val_ts_transforms)
+        # Model improvement: compute_flow=True (only for --model_type i3d) makes
+        # VideoDataset also compute and concatenate optical flow channels onto
+        # each RGB frame -- see video_datasets.VideoDataset/_compute_flow_stack.
+        tr_dataset = VideoDataset(
+            tr_split, fr_per_vid, tr_transforms,
+            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+        )
+        val_dataset = VideoDataset(
+            val_split, fr_per_vid, val_ts_transforms,
+            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+        )
         dataloaders = train_val_dloaders(tr_dataset, val_dataset, batch_size, model_type)
 
         # Define the loss function, optimizer, and learning rate scheduler
         # Model improvement: label smoothing softens the target distribution
         # (instead of a hard one-hot target), discouraging the model from
         # becoming overconfident on training examples it has memorized.
-        loss_func = nn.CrossEntropyLoss(reduction='mean', label_smoothing=0.1)
+        loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)
         # Model improvement: weight decay for regularization.
         # Model improvement: differential learning rates. A backbone_lr_factor < 1.0
         # gives the pretrained CNN backbone a lower LR than the freshly-initialized
@@ -307,7 +328,10 @@ def main(args):
             dataloaders, model, loss_func, opt, lr_scheduler, device, optim_model_dir, n_epochs
         )
         # Evaluate on held-out test set immediately after training and log to W&B.
-        ts_dataset = VideoDataset(ts_split, fr_per_vid, val_ts_transforms)
+        ts_dataset = VideoDataset(
+            ts_split, fr_per_vid, val_ts_transforms,
+            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+        )
         test_dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
         targets, outputs, test_accuracy = evaluate(model, test_dataloaders["test"], device)
         print(f"Final test accuracy: {100 * test_accuracy:.4f}%")
@@ -325,12 +349,14 @@ def main(args):
     if mode == 'eval':
         # Load saved dataset splits
         splits = np.load('./splits.npy', allow_pickle=True)
-        label_dict = np.load('./label_dict.npy', allow_pickle=True).item()
         ts_split = splits.item()['test']
         ts_split = [(sample[0], int(sample[1])) for sample in ts_split]
 
         # Create PyTorch Dataset and DataLoader for the test set
-        ts_dataset = VideoDataset(ts_split, fr_per_vid, val_ts_transforms)
+        ts_dataset = VideoDataset(
+            ts_split, fr_per_vid, val_ts_transforms,
+            compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+        )
         dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
 
         # Load the trained model checkpoint

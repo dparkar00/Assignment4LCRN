@@ -16,9 +16,58 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+import cv2
 from PIL import Image
 import numpy as np
 from sklearn.model_selection import StratifiedGroupKFold
+
+
+def _compute_flow_stack(fr_imgs, size):
+    """
+    Model improvement: dense optical flow (Farneback), used for the two-stream
+    RGB + optical-flow architecture (TwoStreamR3D, see models.py) in the spirit
+    of I3D's two-stream design (Carreira & Zisserman, 2017) -- the model gets
+    direct access to motion information instead of only inferring it indirectly
+    from how appearance features change across a sequence of independent frames.
+
+    Args:
+        fr_imgs (list): List of PIL RGB Image frames (pre-transform).
+        size (tuple): (height, width) to resize frames to before computing flow,
+            matching the RGB stream's spatial resolution so both streams stay
+            spatially aligned.
+
+    Returns:
+        list: List of (2, H, W) float32 tensors (x/y flow components, clipped
+            and scaled to roughly [-1, 1]), one per input frame. The last
+            frame's flow is duplicated from the final consecutive pair so the
+            flow stack has the same length as the RGB stack (there is one fewer
+            flow field than frames, since flow is computed between pairs).
+    """
+    if len(fr_imgs) == 0:
+        return []
+    gray_frames = [
+        cv2.cvtColor(  # pylint: disable=no-member
+            np.array(img.resize((size[1], size[0]))),
+            cv2.COLOR_RGB2GRAY,  # pylint: disable=no-member
+        )
+        for img in fr_imgs
+    ]
+    flows = []
+    for i in range(len(gray_frames) - 1):
+        flow = cv2.calcOpticalFlowFarneback(  # pylint: disable=no-member
+            gray_frames[i], gray_frames[i + 1], None,
+            pyr_scale=0.5, levels=3, winsize=15, iterations=3,
+            poly_n=5, poly_sigma=1.2, flags=0,
+        )
+        # Clip to a fixed range instead of per-clip min/max normalization, so
+        # flow magnitude stays comparable across different clips/videos.
+        flow = np.clip(flow, -20, 20) / 20.0
+        flows.append(torch.from_numpy(flow).permute(2, 0, 1).float())  # (2, H, W)
+    if flows:
+        flows.append(flows[-1])
+    else:
+        flows = [torch.zeros(2, size[0], size[1])] * len(fr_imgs)
+    return flows
 
 
 class VideoDataset(Dataset):
@@ -34,11 +83,21 @@ class VideoDataset(Dataset):
         fr_per_vid (int): Number of frames per video to load (images are taken in order).
         transforms (callable, optional): A function/transform to apply to each frame
             image (e.g., resizing, normalization).
+        compute_flow (bool, optional): Model improvement -- if True, also compute
+            dense optical flow between consecutive frames and concatenate it onto
+            each RGB frame's channels (3 RGB + 2 flow = 5 channels total), for the
+            two-stream RGB+flow architecture (see models.TwoStreamR3D). Default False.
+        flow_size (tuple, optional): (height, width) to resize frames to before
+            computing flow, matching the RGB transform's output resolution so
+            both streams stay spatially aligned. Only used when compute_flow=True.
     """
-    def __init__(self, vid_dataset, fr_per_vid, transforms=None):
+    def __init__(self, vid_dataset, fr_per_vid, transforms=None,
+                 compute_flow=False, flow_size=(112, 112)):
         self.dataset = vid_dataset
         self.fpv = fr_per_vid
         self.transforms = transforms
+        self.compute_flow = compute_flow
+        self.flow_size = flow_size
 
     def __len__(self):
         """Return the number of video samples in the dataset."""
@@ -83,6 +142,16 @@ class VideoDataset(Dataset):
         fr_imgs_trans = (
             [self.transforms(fr_img) for fr_img in fr_imgs] if self.transforms else fr_imgs
         )
+
+        # Model improvement: two-stream RGB + optical flow. Concatenate a 2-channel
+        # flow field onto each frame's 3 RGB channels (-> 5 channels total) before
+        # stacking, so TwoStreamR3D can split them back apart in its forward pass.
+        if self.compute_flow and len(fr_imgs) > 0:
+            flow_stack = _compute_flow_stack(fr_imgs, self.flow_size)
+            fr_imgs_trans = [
+                torch.cat([rgb_t, flow_t], dim=0)
+                for rgb_t, flow_t in zip(fr_imgs_trans, flow_stack)
+            ]
 
         # Stack transformed images into a tensor if available
         if len(fr_imgs_trans) > 0:

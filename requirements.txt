@@ -7,3 +7,6 @@ numpy
 Pillow
 wandb
 pylint
+timm
+einops
+flow-vis
