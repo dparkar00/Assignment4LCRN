@@ -181,7 +181,6 @@ def store_frames(frames, store_path):
         None
     """
     for idx, frame in enumerate(frames):
-        print("processing")
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         path_to_frame = os.path.join(store_path, f"frame{idx}.jpg")
         cv2.imwrite(path_to_frame, frame)
