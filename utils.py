@@ -21,6 +21,14 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from video_datasets import collate_fn_r3d_18, collate_fn_rnn
 
+# Parallel data loading matters a lot here: video clips are loaded frame-by-frame from disk as
+# individual JPEGs (doubled for two-stream, since RGB and flow are each loaded separately), which
+# is I/O- and CPU-bound. Without multiple worker processes, the GPU sits idle waiting on this.
+# pin_memory speeds up the host->GPU transfer once a batch is ready. Tune NUM_WORKERS down to 0
+# if running somewhere with very few CPU cores available.
+NUM_WORKERS = 2
+PIN_MEMORY = True
+
 
 def get_frames(vid, n_frames=1):
     """
@@ -112,6 +120,7 @@ def store_frames(frames, store_path):
         None
     """
     for idx, frame in enumerate(frames):
+        print("processing")
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         path_to_frame = os.path.join(store_path, f"frame{idx}.jpg")
         cv2.imwrite(path_to_frame, frame)
@@ -208,12 +217,10 @@ def compose_dataloaders(train_dataset, val_dataset, test_dataset, batch_size, mo
         dict: Dictionary with keys 'train', 'val', and 'test' mapping to their DataLoaders.
     """
     collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
-    train_dl = DataLoader(train_dataset, batch_size=batch_size,
-                          shuffle=True, collate_fn=collate_fn)
-    val_dl = DataLoader(val_dataset, batch_size=2 * batch_size,
-                        shuffle=False, collate_fn=collate_fn)
-    test_dl = DataLoader(test_dataset, batch_size=2 * batch_size,
-                         shuffle=False, collate_fn=collate_fn)
+    loader_kwargs = {'num_workers': NUM_WORKERS, 'pin_memory': PIN_MEMORY, 'collate_fn': collate_fn}
+    train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_dl = DataLoader(val_dataset, batch_size=2 * batch_size, shuffle=False, **loader_kwargs)
+    test_dl = DataLoader(test_dataset, batch_size=2 * batch_size, shuffle=False, **loader_kwargs)
     return {'train': train_dl, 'val': val_dl, 'test': test_dl}
 
 
@@ -234,16 +241,11 @@ def train_val_dloaders(train_dataset, val_dataset, batch_size, model='lrcn'):
     Returns:
         dict: Dictionary with keys 'train' and 'val' mapping to their respective DataLoaders.
     """
-    if model == "lrcn":
-        train_dl = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, collate_fn=collate_fn_rnn)
-        val_dl = DataLoader(val_dataset, batch_size=2 * batch_size,
-                            shuffle=False, collate_fn=collate_fn_rnn)
-    else:
-        train_dl = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, collate_fn=collate_fn_r3d_18)
-        val_dl = DataLoader(val_dataset, batch_size=2 * batch_size,
-                            shuffle=False, collate_fn=collate_fn_r3d_18)
+    collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
+    train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    val_dl = DataLoader(val_dataset, batch_size=2 * batch_size, shuffle=False,
+                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     dataloaders = {'train': train_dl, 'val': val_dl}
     return dataloaders
 
@@ -263,11 +265,8 @@ def test_dloaders(test_dataset, batch_size, model='lrcn'):
     Returns:
         dict: Dictionary with key 'test' mapping to the test DataLoader.
     """
-    if model == "lrcn":
-        test_dl = DataLoader(test_dataset, batch_size=2 * batch_size,
-                             shuffle=False, collate_fn=collate_fn_rnn)
-    else:
-        test_dl = DataLoader(test_dataset, batch_size=2 * batch_size,
-                             shuffle=False, collate_fn=collate_fn_r3d_18)
+    collate_fn = collate_fn_rnn if model == "lrcn" else collate_fn_r3d_18
+    test_dl = DataLoader(test_dataset, batch_size=2 * batch_size, shuffle=False,
+                         collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     dataloaders = {'test': test_dl}
     return dataloaders

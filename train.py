@@ -26,7 +26,7 @@ import wandb
 # optimizer, scheduler, device, checkpoint dir, epoch count) is independently meaningful and
 # bundling them into a config object would obscure the function's contract more than it helps.
 def train(dataloaders, model, criterion, optimizer, scheduler, device,
-          optim_model_wts_dir, n_epochs=30, use_wandb=False):
+          optim_model_wts_dir, n_epochs=30, use_wandb=False, freeze_backbone_until=0):
     """
     Train and validate the model over a given number of epochs.
     
@@ -37,7 +37,9 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
 
     Args:
         dataloaders (dict): Dictionary containing 'train' and 'val' DataLoaders.
-        model (torch.nn.Module): The video classification model to be trained.
+        model (torch.nn.Module): The video classification model to be trained. If
+                                  freeze_backbone_until > 0, the caller is responsible for
+                                  calling model.freeze_backbone() before passing it in.
         criterion (callable): Loss function.
         optimizer (torch.optim.Optimizer): Optimizer for updating model weights.
         scheduler (torch.optim.lr_scheduler): Learning rate scheduler, which adjusts the
@@ -48,6 +50,12 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         use_wandb (bool, optional): If True, log per-epoch metrics and the best checkpoint to
                                      the currently active wandb run (the caller is responsible
                                      for wandb.init()/wandb.finish()). Default is False.
+        freeze_backbone_until (int, optional): If > 0, the model's backbone is expected to
+                                                already be frozen (see model.freeze_backbone())
+                                                for the first freeze_backbone_until epochs; this
+                                                function calls model.unfreeze_backbone() right
+                                                before that many epochs have elapsed. 0 disables
+                                                this (the model trains as given). Default is 0.
 
     Returns:
         tuple: (model, loss_hist, acc_hist)
@@ -63,21 +71,31 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
     best_model_wts = copy.deepcopy(model.state_dict())
     best_val_acc = 0.0
 
+    # Mixed-precision training: only enabled on CUDA, where tensor cores give a real speedup;
+    # on CPU it has no benefit and GradScaler would just add overhead, so it's a no-op there.
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+
     for epoch in range(n_epochs):
+        if freeze_backbone_until > 0 and epoch == freeze_backbone_until:
+            model.unfreeze_backbone()
+            print(f'Unfreezing backbone at epoch {epoch+1} '
+                  f'(was frozen for the first {freeze_backbone_until} epochs).')
+
         current_lr = get_learning_rate(optimizer)
         print(f'Epoch {epoch+1}/{n_epochs}; Current learning rate {current_lr}')
 
         # Training phase
         model.train()
         train_loss, train_accuracy = get_epoch_loss(
-            model, criterion, dataloaders['train'], device, optimizer)
+            model, criterion, dataloaders['train'], device, optimizer, scaler)
         loss_hist['train'].append(train_loss)
         acc_hist['train'].append(train_accuracy)
 
         # Validation phase
         model.eval()
         with torch.no_grad():
-            val_loss, val_accuracy = get_epoch_loss(model, criterion, dataloaders['val'], device)
+            val_loss, val_accuracy = get_epoch_loss(
+                model, criterion, dataloaders['val'], device, scaler=scaler)
         if val_accuracy > best_val_acc:
             best_val_acc = val_accuracy
             best_model_wts = copy.deepcopy(model.state_dict())
@@ -147,7 +165,7 @@ def batch_correct_preds(output, target):
     return correct_preds
 
 
-def get_batch_loss(criterion, output, target, optimizer=None):
+def get_batch_loss(criterion, output, target, optimizer=None, scaler=None):
     """
     Compute the loss for a mini-batch and perform backpropagation (if optimizer is provided).
     
@@ -157,6 +175,9 @@ def get_batch_loss(criterion, output, target, optimizer=None):
         target (torch.Tensor): True labels for the mini-batch.
         optimizer (torch.optim.Optimizer, optional): Optimizer to update model weights. If
                                                        None, no backpropagation is performed.
+        scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed-precision
+                                                        training. If None or disabled, falls
+                                                        back to a plain backward()/step().
     
     Returns:
         tuple: (loss_value, n_batch_correct_preds)
@@ -168,12 +189,17 @@ def get_batch_loss(criterion, output, target, optimizer=None):
         n_batch_correct_preds = batch_correct_preds(output, target)
     if optimizer:
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
     return loss.item(), n_batch_correct_preds
 
 
-def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
+def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=None):
     """
     Compute the average loss and overall accuracy for an epoch.
 
@@ -187,6 +213,9 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
         device (torch.device): Device (CPU or GPU) on which to perform computations.
         optimizer (torch.optim.Optimizer, optional): If provided, used to update model weights
                                                        during training.
+        scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed-precision
+                                                        training; also controls whether the
+                                                        forward pass runs under autocast.
 
     Returns:
         tuple: (loss, accuracy)
@@ -195,17 +224,21 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
     """
     running_loss, running_total_correct_preds = 0.0, 0.0
     len_dataset = len(dataloader.dataset)
+    amp_enabled = scaler is not None and scaler.is_enabled()
 
     for x_batch, y_batch in tqdm(dataloader):
         y_batch = y_batch.to(device)
         if isinstance(x_batch, (tuple, list)):
             # Two-stream input (e.g. RGB + optical flow): move each stream to device separately.
             x_batch = tuple(x.to(device) for x in x_batch)
-            output = model(*x_batch)
         else:
             x_batch = x_batch.to(device)
-            output = model(x_batch)
-        batch_loss, n_batch_correct_preds = get_batch_loss(criterion, output, y_batch, optimizer)
+
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            output = model(*x_batch) if isinstance(x_batch, tuple) else model(x_batch)
+
+        batch_loss, n_batch_correct_preds = get_batch_loss(
+            criterion, output, y_batch, optimizer, scaler)
 
         running_loss += batch_loss
         running_total_correct_preds += n_batch_correct_preds

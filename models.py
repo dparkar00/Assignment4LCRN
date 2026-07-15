@@ -48,6 +48,30 @@ class I3DStream(nn.Module):
         """
         return self.backbone(x)
 
+    def head_parameters(self):
+        """Return the parameters of the (freshly-initialized) classification head only."""
+        return list(self.backbone.blocks[-1].proj.parameters())
+
+    def backbone_parameters(self):
+        """Return the parameters of the pretrained I3D trunk, excluding the classification head.
+
+        Uses id()-based filtering rather than `in`/`==` on the parameters directly: PyTorch
+        overrides tensor equality to be element-wise, so comparing Parameter objects with `in`
+        can crash outright (mismatched shapes) or silently misbehave (ambiguous truth value).
+        """
+        head_ids = {id(p) for p in self.head_parameters()}
+        return [p for p in self.backbone.parameters() if id(p) not in head_ids]
+
+    def freeze_backbone(self):
+        """Freeze the pretrained trunk (requires_grad=False), leaving the head trainable."""
+        for p in self.backbone_parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze the pretrained trunk so the whole stream fine-tunes again."""
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
 
 class TwoStreamI3D(nn.Module):
     """
@@ -84,6 +108,24 @@ class TwoStreamI3D(nn.Module):
         flow_probs = torch.softmax(self.flow_stream(flow), dim=1)
         fused_probs = (1 - self.flow_weight) * rgb_probs + self.flow_weight * flow_probs
         return torch.log(fused_probs + 1e-8)
+
+    def backbone_parameters(self):
+        """Return the pretrained-trunk parameters of both streams (excludes both heads)."""
+        return self.rgb_stream.backbone_parameters() + self.flow_stream.backbone_parameters()
+
+    def head_parameters(self):
+        """Return the classification-head parameters of both streams."""
+        return self.rgb_stream.head_parameters() + self.flow_stream.head_parameters()
+
+    def freeze_backbone(self):
+        """Freeze both streams' pretrained trunks, leaving both heads trainable."""
+        self.rgb_stream.freeze_backbone()
+        self.flow_stream.freeze_backbone()
+
+    def unfreeze_backbone(self):
+        """Unfreeze both streams' pretrained trunks so the full model fine-tunes again."""
+        self.rgb_stream.unfreeze_backbone()
+        self.flow_stream.unfreeze_backbone()
 
 
 class Identity(nn.Module):
@@ -202,3 +244,21 @@ class LRCN(nn.Module):
         # Pass the final output through the fully-connected layer to get class logits.
         out = self.fc(out)
         return out
+
+    def backbone_parameters(self):
+        """Return the parameters of the pretrained 2D CNN backbone."""
+        return list(self.base_model.parameters())
+
+    def head_parameters(self):
+        """Return the parameters of the LSTM + final classification layer."""
+        return list(self.rnn.parameters()) + list(self.fc.parameters())
+
+    def freeze_backbone(self):
+        """Freeze the pretrained CNN backbone, leaving the LSTM/fc head trainable."""
+        for p in self.backbone_parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze the pretrained CNN backbone so the whole model fine-tunes again."""
+        for p in self.backbone_parameters():
+            p.requires_grad = True

@@ -43,16 +43,17 @@ def test(model, dataloader, device):
         total_correct_preds = 0.0
         len_dataset = len(dataloader.dataset)
         targets, outputs = [], []
+        amp_enabled = device.type == 'cuda'
         for x_batch, y_batch in tqdm(dataloader):
             y_batch = y_batch.to(device)
             if isinstance(x_batch, (tuple, list)):
                 # Two-stream input (e.g. RGB + optical flow): move each stream to device
                 # separately.
                 x_batch = tuple(x.to(device) for x in x_batch)
-                output = model(*x_batch)
             else:
                 x_batch = x_batch.to(device)
-                output = model(x_batch)
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                output = model(*x_batch) if isinstance(x_batch, tuple) else model(x_batch)
             pred = output.argmax(dim=1, keepdim=True)
             correct_preds = pred.eq(y_batch.view_as(pred)).sum().item()
             total_correct_preds += correct_preds

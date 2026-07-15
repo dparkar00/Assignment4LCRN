@@ -39,7 +39,8 @@ from tqdm import tqdm
 from video_datasets import (VideoDataset, TwoStreamVideoDataset, load_dataset,
                              dataset_split, collate_fn_two_stream)
 from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
-                    test_dloaders, compute_flow_frames, store_frames)
+                    test_dloaders, compute_flow_frames, store_frames,
+                    NUM_WORKERS, PIN_MEMORY)
 from models import LRCN, TwoStreamI3D
 from train import train
 from test import test  # pylint: disable=wrong-import-order
@@ -74,6 +75,12 @@ def args_parser():
         -wp/--wandb_project: Weights & Biases project name (default 'hmdb51-video-classification').
         -rn/--run_name: Weights & Biases run name (optional; wandb auto-generates one if omitted).
         --no_wandb: Disable Weights & Biases logging entirely (enabled by default in train mode).
+        -fbu/--freeze_backbone_until: Freeze the pretrained backbone for this many initial
+                                       epochs (training only the classification head), then
+                                       unfreeze. 0 disables freezing (default 0).
+        -blf/--backbone_lr_factor: Multiply the backbone's learning rate by this factor
+                                    relative to the head's learning rate, e.g. 0.1 for a
+                                    backbone LR 10x lower than the head's (default 1.0).
     """
     parser = argparse.ArgumentParser(description='Video Classification Training')
 
@@ -117,6 +124,13 @@ def args_parser():
     parser.add_argument('--no_wandb', action='store_true',
                          help='Disable Weights & Biases logging')
 
+    parser.add_argument('-fbu', '--freeze_backbone_until', type=int, default=0,
+                         help='Freeze the pretrained backbone for this many initial epochs '
+                              '(0 = never freeze)')
+    parser.add_argument('-blf', '--backbone_lr_factor', type=float, default=1.0,
+                         help="Backbone LR = learning_rate * backbone_lr_factor; head LR = "
+                              "learning_rate (e.g. 0.1 for a 10x lower backbone LR)")
+
     return parser.parse_args()
 
 
@@ -152,9 +166,11 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
         val_dataset = TwoStreamVideoDataset(val_split, args.flow_dir, args.fr_per_vid,
                                              val_ts_transforms, val_ts_transforms)
         train_dl = DataLoader(tr_dataset, batch_size=args.batch_size, shuffle=True,
-                               collate_fn=collate_fn_two_stream)
+                               collate_fn=collate_fn_two_stream,
+                               num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
         val_dl = DataLoader(val_dataset, batch_size=2 * args.batch_size, shuffle=False,
-                             collate_fn=collate_fn_two_stream)
+                             collate_fn=collate_fn_two_stream,
+                             num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
         return {'train': train_dl, 'val': val_dl}
 
     tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms)
@@ -184,9 +200,17 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
     else:
         loss_func = nn.CrossEntropyLoss(reduction='sum')
 
-    opt = optim.Adam(model.parameters(), lr=args.learning_rate)
+    opt = optim.Adam([
+        {'params': model.backbone_parameters(), 'lr': args.learning_rate * args.backbone_lr_factor},
+        {'params': model.head_parameters(), 'lr': args.learning_rate},
+    ])
     lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
     os.makedirs("./models", exist_ok=True)
+
+    if args.freeze_backbone_until > 0:
+        model.freeze_backbone()
+        print(f'Backbone frozen for the first {args.freeze_backbone_until} epochs '
+              f'(training only the classification head).')
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -194,7 +218,7 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
 
     model.to(device)
     train(dataloaders, model, loss_func, opt, lr_scheduler, device, './models',
-          args.n_epochs, use_wandb=use_wandb)
+          args.n_epochs, use_wandb=use_wandb, freeze_backbone_until=args.freeze_backbone_until)
 
     if use_wandb:
         wandb.finish()
@@ -213,7 +237,8 @@ def run_eval(args, model, device, val_ts_transforms):
         ts_dataset = TwoStreamVideoDataset(ts_split, args.flow_dir, args.fr_per_vid,
                                             val_ts_transforms, val_ts_transforms)
         dataloaders = {'test': DataLoader(ts_dataset, batch_size=2 * args.batch_size,
-                                           shuffle=False, collate_fn=collate_fn_two_stream)}
+                                           shuffle=False, collate_fn=collate_fn_two_stream,
+                                           num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)}
     else:
         ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms)
         dataloaders = test_dloaders(ts_dataset, args.batch_size, args.model_type)
