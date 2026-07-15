@@ -246,7 +246,13 @@ def compose_data_transforms(height, width, mean, std):
     train_transforms = transforms.Compose([
         transforms.RandomResizedCrop((height, width), scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        # degrees=0: this pipeline is also used for optical-flow pseudo-RGB images (see
+        # video_datasets.TwoStreamVideoDataset), where pixel VALUES encode a motion direction.
+        # Rotating the image would rotate pixel positions without rotating the encoded
+        # direction values to match, producing physically inconsistent flow data. Translate
+        # and scale don't have this problem (they change spatial position/extent, not
+        # direction), so they're kept.
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
