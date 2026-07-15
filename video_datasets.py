@@ -56,15 +56,17 @@ class VideoDataset(Dataset):
 
         Returns:
             tuple: (frames_tensor, label) where frames_tensor is a tensor of shape (T, C, H, W)
-                   with T being the number of frames (up to fr_per_vid) and label is an integer.
+                   with T == fr_per_vid and label is an integer.
         """
-        # Get all JPEG frame paths from the video directory and select up to fr_per_vid frames
+        # Get all JPEG frame paths from the video directory and uniformly sample exactly
+        # fpv of them. linspace is used regardless of whether the video has more or fewer
+        # frames than fpv: when there are fewer, indices repeat so every clip in a batch still
+        # comes out to exactly fpv frames (a fixed-size 3D-CNN batch can't stack clips of
+        # different lengths).
         fr_paths = sorted(glob.glob(self.dataset[idx][0] + '/*.jpg'))
-        if len(fr_paths) > self.fpv:
+        if fr_paths:
             sample_idx = np.linspace(0, len(fr_paths) - 1, self.fpv).astype(int)
             fr_paths = [fr_paths[i] for i in sample_idx]
-        else:
-            fr_paths = fr_paths[:self.fpv]
 
         # Open images using PIL
         fr_imgs = [Image.open(fr_path) for fr_path in fr_paths]
@@ -124,11 +126,9 @@ class TwoStreamVideoDataset(Dataset):
         the given random seed before every frame's transform so the whole clip gets one
         consistent augmentation decision (shared across streams via a common clip_seed)."""
         fr_paths = sorted(glob.glob(dir_path + '/*.jpg'))
-        if len(fr_paths) > self.fpv:
+        if fr_paths:
             sample_idx = np.linspace(0, len(fr_paths) - 1, self.fpv).astype(int)
             fr_paths = [fr_paths[i] for i in sample_idx]
-        else:
-            fr_paths = fr_paths[:self.fpv]
         fr_imgs = [Image.open(fr_path) for fr_path in fr_paths]
         if not fr_imgs:
             return torch.empty(0)
