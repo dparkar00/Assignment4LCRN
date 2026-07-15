@@ -14,8 +14,10 @@ for video classification tasks. It includes functions for:
 # cv2.cvtColor, etc.), so it flags every real cv2 attribute access as a false positive.
 
 import os
+import glob
 import cv2
 import numpy as np
+from PIL import Image
 
 from torchvision import transforms
 from torch.utils.data import DataLoader
@@ -124,6 +126,44 @@ def compute_flow_frames(frames):
 
     # Duplicate the first computed flow field so the flow clip matches the RGB clip's length.
     return [flow_frames[0]] + flow_frames
+
+
+def preprocess_video_flow(vid_path, out_dir):
+    """
+    Compute and store optical flow frames for a single video, skipping it if flow has already
+    been computed (out_dir already has the same frame count as vid_path's RGB frames).
+
+    This is a per-video unit of work, designed to be dispatched to a worker process by
+    run.py's preprocess_flow mode (see ProcessPoolExecutor there) so flow computation across
+    many videos can run in parallel across CPU cores instead of one video at a time. Optical
+    flow between two consecutive frames of one video is independent of every other video, so
+    this parallelizes cleanly with no correctness risk. cv2's own internal multi-threading is
+    disabled here since many of these run concurrently in separate processes -- without this,
+    each process would try to use all available cores for its own single video, oversubscribing
+    the machine instead of letting the process pool divide the cores across videos.
+
+    Args:
+        vid_path (str): Path to the video's RGB frame directory.
+        out_dir (str): Path to write this video's flow frames to.
+
+    Returns:
+        bool: True if flow was (re)computed, False if skipped (already done, or too few frames).
+    """
+    cv2.setNumThreads(1)
+    fr_paths = sorted(glob.glob(vid_path + '/*.jpg'))
+    if len(fr_paths) < 2:
+        return False
+
+    existing = glob.glob(out_dir + '/*.jpg')
+    if len(existing) == len(fr_paths):
+        return False
+
+    frames = [np.array(Image.open(p).convert('RGB')) for p in fr_paths]
+    flow_frames = compute_flow_frames(frames)
+
+    os.makedirs(out_dir, exist_ok=True)
+    store_frames(flow_frames, out_dir)
+    return True
 
 
 def store_frames(frames, store_path):

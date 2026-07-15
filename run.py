@@ -24,8 +24,8 @@ The module also includes a helper function for parsing command-line arguments.
 """
 
 import os
-import glob
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -33,13 +33,12 @@ import wandb
 from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-from PIL import Image
 from tqdm import tqdm
 
 from video_datasets import (VideoDataset, TwoStreamVideoDataset, load_dataset,
                              dataset_split, collate_fn_two_stream)
 from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
-                    test_dloaders, compute_flow_frames, store_frames, dataloader_kwargs)
+                    test_dloaders, preprocess_video_flow, dataloader_kwargs, NUM_WORKERS)
 from models import LRCN, TwoStreamI3D
 from train import train
 from test import test  # pylint: disable=wrong-import-order
@@ -256,32 +255,29 @@ def run_preprocess_flow(args):
     the class/video subfolder structure so TwoStreamVideoDataset can pair the two directories up.
     This is a one-off step to run before training/evaluating model_type=i3d_two_stream.
 
-    Idempotent/resumable: a video is skipped if its flow output directory already contains the
-    same number of frames as its RGB input, so re-running this (in the same session, or after a
-    session restart) does not redo work that already finished.
+    Idempotent/resumable: a video is skipped (by preprocess_video_flow) if its flow output
+    directory already contains the same number of frames as its RGB input, so re-running this
+    (in the same session, or after a session restart) does not redo work that already finished.
+
+    Runs across a process pool (one video per worker) instead of one video at a time on a
+    single core, since flow computation for different videos is fully independent -- on a
+    multi-core machine this is the difference between using one core and using all of them.
     """
+    jobs = []
     for vid_cat in sorted(os.listdir(args.frame_dir)):
         cat_path = os.path.join(args.frame_dir, vid_cat)
         if not os.path.isdir(cat_path):
             continue
-        for vid in tqdm(sorted(os.listdir(cat_path)), desc=vid_cat):
+        for vid in sorted(os.listdir(cat_path)):
             vid_path = os.path.join(cat_path, vid)
-            fr_paths = sorted(glob.glob(vid_path + '/*.jpg'))
-            if len(fr_paths) < 2:
-                continue
-
             out_dir = os.path.join(args.flow_dir, vid_cat, vid)
-            existing = glob.glob(out_dir + '/*.jpg')
-            if len(existing) == len(fr_paths):
-                # Flow already computed for this video (same frame count as the RGB clip) --
-                # skip so re-running this step doesn't redo already-finished work.
-                continue
+            jobs.append((vid_path, out_dir))
 
-            frames = [np.array(Image.open(p).convert('RGB')) for p in fr_paths]
-            flow_frames = compute_flow_frames(frames)
-
-            os.makedirs(out_dir, exist_ok=True)
-            store_frames(flow_frames, out_dir)
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = [executor.submit(preprocess_video_flow, vid_path, out_dir)
+                   for vid_path, out_dir in jobs]
+        for _ in tqdm(as_completed(futures), total=len(futures), desc='Computing optical flow'):
+            pass
 
 
 def main(args):
