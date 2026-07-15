@@ -70,6 +70,15 @@ def _compute_flow_stack(fr_imgs, size):
     return flows
 
 
+def _flow_cache_path(cache_dir, clip_dir, n_frames, size):
+    """
+    Build a deterministic, filesystem-safe cache filename for a clip's computed
+    optical flow, so repeated epochs can reuse it instead of recomputing.
+    """
+    safe_name = clip_dir.replace(os.sep, "_").replace(":", "_")
+    return os.path.join(cache_dir, f"{safe_name}_n{n_frames}_{size[0]}x{size[1]}.npy")
+
+
 class VideoDataset(Dataset):
     """
     PyTorch Dataset class for loading video data from directories of frame images.
@@ -90,14 +99,25 @@ class VideoDataset(Dataset):
         flow_size (tuple, optional): (height, width) to resize frames to before
             computing flow, matching the RGB transform's output resolution so
             both streams stay spatially aligned. Only used when compute_flow=True.
+        flow_cache_dir (str, optional): PERFORMANCE IMPROVEMENT -- if set, computed
+            optical flow is cached to disk as .npy files and reused on later
+            epochs instead of being recomputed every time. Flow is deterministic
+            per clip (computed from the raw frames before RGB augmentation is
+            applied), so recomputing it every epoch is pure wasted CPU work --
+            caching cuts that cost to a one-time computation per clip. Only used
+            when compute_flow=True.
     """
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def __init__(self, vid_dataset, fr_per_vid, transforms=None,
-                 compute_flow=False, flow_size=(112, 112)):
+                 compute_flow=False, flow_size=(112, 112), flow_cache_dir=None):
         self.dataset = vid_dataset
         self.fpv = fr_per_vid
         self.transforms = transforms
         self.compute_flow = compute_flow
         self.flow_size = flow_size
+        self.flow_cache_dir = flow_cache_dir
+        if flow_cache_dir is not None:
+            os.makedirs(flow_cache_dir, exist_ok=True)
 
     def __len__(self):
         """Return the number of video samples in the dataset."""
@@ -146,8 +166,23 @@ class VideoDataset(Dataset):
         # Model improvement: two-stream RGB + optical flow. Concatenate a 2-channel
         # flow field onto each frame's 3 RGB channels (-> 5 channels total) before
         # stacking, so TwoStreamR3D can split them back apart in its forward pass.
+        # PERFORMANCE IMPROVEMENT: flow is deterministic per clip (computed from
+        # raw frames before RGB augmentation), so it's cached to disk on first
+        # computation and reused on every subsequent epoch instead of being
+        # recomputed from scratch each time -- see flow_cache_dir above.
         if self.compute_flow and len(fr_imgs) > 0:
-            flow_stack = _compute_flow_stack(fr_imgs, self.flow_size)
+            clip_dir = self.dataset[idx][0]
+            cache_path = (
+                _flow_cache_path(self.flow_cache_dir, clip_dir, len(fr_imgs), self.flow_size)
+                if self.flow_cache_dir is not None else None
+            )
+            if cache_path is not None and os.path.exists(cache_path):
+                flow_arr = np.load(cache_path)
+                flow_stack = [torch.from_numpy(f).float() for f in flow_arr]
+            else:
+                flow_stack = _compute_flow_stack(fr_imgs, self.flow_size)
+                if cache_path is not None:
+                    np.save(cache_path, torch.stack(flow_stack).numpy())
             fr_imgs_trans = [
                 torch.cat([rgb_t, flow_t], dim=0)
                 for rgb_t, flow_t in zip(fr_imgs_trans, flow_stack)

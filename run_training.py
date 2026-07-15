@@ -146,6 +146,12 @@ def args_parser():
         help="Number of trailing ResNet child modules to keep trainable; earlier "
              "layers are frozen (model improvement, partial fine-tuning)",
     )
+    parser.add_argument(
+        "-fcd", "--flow_cache_dir", type=str, default="./flow_cache",
+        help="PERFORMANCE IMPROVEMENT: directory to cache computed optical flow "
+             "(only used with --model_type i3d). Flow is deterministic per clip, "
+             "so caching it avoids recomputing it from scratch every epoch.",
+    )
 
     parser.add_argument("-bs", "--batch_size", type=int, required=True, help="Mini-batch size")
     parser.add_argument(
@@ -238,14 +244,17 @@ def trainer(args):
     tr_dataset = VideoDataset(
         tr_split, fr_per_vid, tr_transforms,
         compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
     )
     val_dataset = VideoDataset(
         val_split, fr_per_vid, val_ts_transforms,
         compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
     )
     ts_dataset = VideoDataset(
         ts_split, fr_per_vid, val_ts_transforms,
         compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
     )
 
     # Compose DataLoaders for training, validation, and test using a custom function

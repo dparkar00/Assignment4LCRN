@@ -139,6 +139,12 @@ def args_parser():
         help="Number of trailing ResNet child modules to keep trainable; earlier "
              "layers are frozen (model improvement, partial fine-tuning)",
     )
+    parser.add_argument(
+        "-fcd", "--flow_cache_dir", type=str, default="./flow_cache",
+        help="PERFORMANCE IMPROVEMENT: directory to cache computed optical flow "
+             "(only used with --model_type i3d). Flow is deterministic per clip, "
+             "so caching it avoids recomputing it from scratch every epoch.",
+    )
 
     parser.add_argument(
         "-m", "--mode", type=str, default="train", required=True, help="'train' or 'eval'"
@@ -278,10 +284,12 @@ def main(args):
         tr_dataset = VideoDataset(
             tr_split, fr_per_vid, tr_transforms,
             compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
         )
         val_dataset = VideoDataset(
             val_split, fr_per_vid, val_ts_transforms,
             compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
         )
         dataloaders = train_val_dloaders(tr_dataset, val_dataset, batch_size, model_type)
 
@@ -331,6 +339,7 @@ def main(args):
         ts_dataset = VideoDataset(
             ts_split, fr_per_vid, val_ts_transforms,
             compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
         )
         test_dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
         targets, outputs, test_accuracy = evaluate(model, test_dataloaders["test"], device)
@@ -356,6 +365,7 @@ def main(args):
         ts_dataset = VideoDataset(
             ts_split, fr_per_vid, val_ts_transforms,
             compute_flow=(model_type == 'i3d'), flow_size=(h, w),
+            flow_cache_dir=args.flow_cache_dir if model_type == 'i3d' else None,
         )
         dataloaders = test_dloaders(ts_dataset, batch_size, model_type)
 
