@@ -132,6 +132,12 @@ def args_parser():
     parser.add_argument('-blf', '--backbone_lr_factor', type=float, default=1.0,
                          help="Backbone LR = learning_rate * backbone_lr_factor; head LR = "
                               "learning_rate (e.g. 0.1 for a 10x lower backbone LR)")
+    parser.add_argument('-gcn', '--grad_clip_norm', type=float, default=5.0,
+                         help='Max global gradient norm for gradient clipping, applied every '
+                              'training step (0 or negative disables clipping). A safety net '
+                              'against occasional large-gradient batches destabilizing '
+                              'training, particularly relevant since optimizer momentum now '
+                              'resets on every LR drop (default 5.0).')
 
     parser.add_argument('-tta', '--tta_clips', type=int, default=1,
                          help='Number of temporal clips to sample per test video and average '
@@ -259,8 +265,10 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):  # pylint:
         wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
 
     model.to(device)
+    grad_clip_norm = args.grad_clip_norm if args.grad_clip_norm > 0 else None
     train(dataloaders, model, loss_func, opt, lr_scheduler, device, './models',
-          args.n_epochs, use_wandb=use_wandb, freeze_backbone_until=args.freeze_backbone_until)
+          args.n_epochs, use_wandb=use_wandb, freeze_backbone_until=args.freeze_backbone_until,
+          grad_clip_norm=grad_clip_norm)
 
     if use_wandb:
         wandb.finish()

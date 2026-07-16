@@ -26,7 +26,8 @@ import wandb
 # optimizer, scheduler, device, checkpoint dir, epoch count) is independently meaningful and
 # bundling them into a config object would obscure the function's contract more than it helps.
 def train(dataloaders, model, criterion, optimizer, scheduler, device,
-          optim_model_wts_dir, n_epochs=30, use_wandb=False, freeze_backbone_until=0):
+          optim_model_wts_dir, n_epochs=30, use_wandb=False, freeze_backbone_until=0,
+          grad_clip_norm=None):
     """
     Train and validate the model over a given number of epochs.
     
@@ -89,7 +90,8 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         # Training phase
         model.train()
         train_loss, train_accuracy = get_epoch_loss(
-            model, criterion, dataloaders['train'], device, optimizer, scaler)
+            model, criterion, dataloaders['train'], device, optimizer, scaler,
+            grad_clip_norm=grad_clip_norm)
         loss_hist['train'].append(train_loss)
         acc_hist['train'].append(train_accuracy)
 
@@ -185,7 +187,8 @@ def batch_correct_preds(output, target):
     return correct_preds
 
 
-def get_batch_loss(criterion, output, target, optimizer=None, scaler=None):
+def get_batch_loss(criterion, output, target, model=None, optimizer=None, scaler=None,
+                    grad_clip_norm=None):
     """
     Compute the loss for a mini-batch and perform backpropagation (if optimizer is provided).
     
@@ -193,11 +196,24 @@ def get_batch_loss(criterion, output, target, optimizer=None, scaler=None):
         criterion (callable): Loss function.
         output (torch.Tensor): Model outputs for the mini-batch.
         target (torch.Tensor): True labels for the mini-batch.
+        model (torch.nn.Module, optional): The model being trained; only needed (along with
+                                            optimizer) if grad_clip_norm is set, since clipping
+                                            needs model.parameters().
         optimizer (torch.optim.Optimizer, optional): Optimizer to update model weights. If
                                                        None, no backpropagation is performed.
         scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed-precision
                                                         training. If None or disabled, falls
                                                         back to a plain backward()/step().
+        grad_clip_norm (float, optional): If set, clips the global gradient norm to this value
+                                           before the optimizer step -- a standard stabilizer
+                                           against occasional large-gradient batches, and
+                                           particularly relevant now that train() resets
+                                           optimizer momentum on every LR drop (see train()),
+                                           since a freshly-reset Adam state has less smoothing
+                                           for its first few post-reset steps. Under AMP, the
+                                           scaled gradients are explicitly unscaled first --
+                                           clipping against the scaled values would clip at the
+                                           wrong threshold entirely. None or 0 disables this.
     
     Returns:
         tuple: (loss_value, n_batch_correct_preds)
@@ -211,15 +227,21 @@ def get_batch_loss(criterion, output, target, optimizer=None, scaler=None):
         optimizer.zero_grad()
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
+            if grad_clip_norm:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if grad_clip_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
     return loss.item(), n_batch_correct_preds
 
 
-def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=None):
+def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=None,
+                    grad_clip_norm=None):
     """
     Compute the average loss and overall accuracy for an epoch.
 
@@ -236,6 +258,9 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=
         scaler (torch.cuda.amp.GradScaler, optional): Gradient scaler for mixed-precision
                                                         training; also controls whether the
                                                         forward pass runs under autocast.
+        grad_clip_norm (float, optional): Passed through to get_batch_loss; see there for
+                                           details. Only has an effect when optimizer is set
+                                           (i.e. during training, not validation/eval).
 
     Returns:
         tuple: (loss, accuracy)
@@ -264,7 +289,8 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=
             output = model(*x_batch) if isinstance(x_batch, tuple) else model(x_batch)
 
         batch_loss, n_batch_correct_preds = get_batch_loss(
-            criterion, output, y_batch, optimizer, scaler)
+            criterion, output, y_batch, model=model, optimizer=optimizer, scaler=scaler,
+            grad_clip_norm=grad_clip_norm)
 
         running_loss += batch_loss
         running_total_correct_preds += n_batch_correct_preds
