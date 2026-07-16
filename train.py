@@ -117,15 +117,21 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
             model.load_state_dict(best_model_wts)
 
         if use_wandb:
-            wandb.log({
+            log_dict = {
                 'epoch': epoch + 1,
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'train_accuracy': train_accuracy,
                 'val_accuracy': val_accuracy,
                 'best_val_accuracy': best_val_acc,
-                'learning_rate': current_lr,
-            })
+            }
+            # Log every optimizer param group's LR individually (e.g. backbone vs head when
+            # --backbone_lr_factor is used), not just the first group -- logging only
+            # current_lr here would show the same misleading single value we fixed in the
+            # console print above.
+            for group_idx, param_group in enumerate(optimizer.param_groups):
+                log_dict[f'learning_rate_group_{group_idx}'] = param_group['lr']
+            wandb.log(log_dict)
 
         print(f"train loss: {train_loss:.6f}, val loss: {val_loss:.6f}, "
               f"accuracy: {100*val_accuracy:.2f}")
@@ -229,6 +235,12 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None, scaler=
     amp_enabled = scaler is not None and scaler.is_enabled()
 
     for x_batch, y_batch in tqdm(dataloader):
+        if y_batch is None:
+            # Every sample in this batch was invalid (e.g. a video with zero extractable
+            # frames) -- the collate function returns (None, None) in that case. Skip rather
+            # than crash on .to(device); this should be rare in practice given the frame
+            # sampling always produces fpv frames whenever at least one exists.
+            continue
         y_batch = y_batch.to(device)
         if isinstance(x_batch, (tuple, list)):
             # Two-stream input (e.g. RGB + optical flow): move each stream to device separately.

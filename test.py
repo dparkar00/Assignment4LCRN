@@ -53,6 +53,10 @@ def predict_probs(model, dataloader, device, is_log_prob):
     batch_probs, targets = [], []
     with torch.no_grad():
         for x_batch, y_batch in tqdm(dataloader):
+            if y_batch is None:
+                # Every sample in this batch was invalid (e.g. a video with zero extractable
+                # frames) -- the collate function returns (None, None) in that case.
+                continue
             y_batch = y_batch.to(device)
             if isinstance(x_batch, (tuple, list)):
                 x_batch = tuple(x.to(device) for x in x_batch)
@@ -93,6 +97,10 @@ def test(model, dataloader, device):
         targets, outputs = [], []
         amp_enabled = device.type == 'cuda'
         for x_batch, y_batch in tqdm(dataloader):
+            if y_batch is None:
+                # Every sample in this batch was invalid (e.g. a video with zero extractable
+                # frames) -- the collate function returns (None, None) in that case.
+                continue
             y_batch = y_batch.to(device)
             if isinstance(x_batch, (tuple, list)):
                 # Two-stream input (e.g. RGB + optical flow): move each stream to device

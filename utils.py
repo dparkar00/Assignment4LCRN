@@ -17,6 +17,7 @@ import os
 import glob
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 from torchvision import transforms
@@ -35,13 +36,37 @@ NUM_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 PIN_MEMORY = True
 
 
+def _seed_worker(_worker_id):
+    """
+    Reseed NumPy's global RNG for a DataLoader worker process.
+
+    PyTorch's default worker initialization reseeds torch's RNG and Python's built-in random
+    module with a distinct, well-separated seed per worker -- but explicitly does NOT reseed
+    NumPy's global RNG (this is a documented PyTorch behavior, not an oversight on their part).
+    Since video_datasets._sample_frame_indices uses np.random.randint for temporal-sampling
+    augmentation, and worker processes are forked from the same parent state, different workers
+    could otherwise share near-identical initial NumPy random state -- producing correlated or
+    duplicate "random" frame choices across workers instead of genuinely independent ones,
+    quietly undermining the augmentation. torch.initial_seed() returns the per-worker seed
+    PyTorch already assigned (base_seed + worker_id), so reusing it here keeps every worker's
+    NumPy state distinct too.
+
+    Args:
+        _worker_id (int): DataLoader worker id (unused directly; part of the required
+                           worker_init_fn signature).
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+
+
 def dataloader_kwargs():
     """
     Extra DataLoader kwargs for parallel, prefetching data loading, centralized here so every
     DataLoader in this project uses the same, valid combination. persistent_workers keeps worker
     processes alive between epochs instead of respawning them each time (meaningful with many
     short epochs); prefetch_factor keeps more batches queued ahead of the GPU so it's less
-    likely to stall. Both are only valid arguments when num_workers > 0.
+    likely to stall. worker_init_fn fixes NumPy's per-worker RNG correlation (see _seed_worker).
+    persistent_workers, prefetch_factor, and worker_init_fn are only valid when num_workers > 0.
 
     Returns:
         dict: Kwargs to unpack into a DataLoader(...) call.
@@ -50,6 +75,7 @@ def dataloader_kwargs():
     if NUM_WORKERS > 0:
         kwargs['persistent_workers'] = True
         kwargs['prefetch_factor'] = 4
+        kwargs['worker_init_fn'] = _seed_worker
     return kwargs
 
 
