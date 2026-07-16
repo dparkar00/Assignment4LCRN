@@ -149,6 +149,83 @@ class TwoStreamI3D(nn.Module):
         self.flow_stream.unfreeze_backbone()
 
 
+class X3DStream(nn.Module):
+    """
+    Single-stream X3D (Kinetics-400 pretrained) classifier.
+
+    X3D (Feichtenhofer et al., 2020) was designed via architecture search specifically for the
+    accuracy-per-parameter tradeoff, not raw capacity -- X3D-M has roughly 3-4M parameters,
+    an order of magnitude smaller than a single I3D-R50 stream (~28M), let alone the two full
+    streams TwoStreamI3D uses (~56M combined). It's RGB-only: no separate optical-flow stream
+    or preprocessing pipeline is needed, since X3D captures motion through dense temporal
+    sampling of the RGB signal itself. Given every prior training run on this dataset has shown
+    the same overfitting signature (train loss falling much faster than val), a smaller,
+    more parameter-efficient backbone is a direct, principled response to that specific,
+    repeatedly-observed problem -- not just a different architecture for its own sake.
+
+    Args:
+        n_classes (int): Number of output classes.
+        pretrained (bool): If True, load Kinetics-400 pretrained weights.
+        variant (str): Which X3D size to use ('x3d_xs', 'x3d_s', 'x3d_m', 'x3d_l'). Default
+                       'x3d_m' expects 16-frame, 224x224 clips -- the same clip shape this
+                       project's I3D pipeline already produces, so no data pipeline changes
+                       are needed to switch architectures.
+    """
+    def __init__(self, n_classes, pretrained=True, variant='x3d_m'):
+        super().__init__()
+        self.backbone = torch.hub.load('facebookresearch/pytorchvideo', variant,
+                                        pretrained=pretrained)
+        # Replace the Kinetics-400 head (400 classes) with one sized for this task.
+        in_features = self.backbone.blocks[-1].proj.in_features
+        self.backbone.blocks[-1].proj = nn.Linear(in_features, n_classes)
+        self._backbone_frozen = False
+
+    def forward(self, x):
+        """
+        Args:
+            x (Tensor): Clip tensor of shape (batch, 3, time, H, W).
+        Returns:
+            Tensor: Class logits of shape (batch, n_classes).
+        """
+        return self.backbone(x)
+
+    def head_parameters(self):
+        """Return the parameters of the (freshly-initialized) classification head only."""
+        return list(self.backbone.blocks[-1].proj.parameters())
+
+    def backbone_parameters(self):
+        """Return the parameters of the pretrained X3D trunk, excluding the classification
+        head. Uses id()-based filtering rather than `in`/`==` -- see I3DStream above for why
+        comparing Parameter objects directly can crash or silently misbehave."""
+        head_ids = {id(p) for p in self.head_parameters()}
+        return [p for p in self.backbone.parameters() if id(p) not in head_ids]
+
+    def freeze_backbone(self):
+        """Freeze the pretrained trunk: requires_grad=False stops weight updates, and marking
+        _backbone_frozen makes train() (below) keep its BatchNorm layers in eval mode too --
+        see I3DStream above for why a one-time eval() call alone would not be durable."""
+        self._backbone_frozen = True
+        for p in self.backbone_parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze the pretrained trunk so the whole stream (weights and BatchNorm stats)
+        fine-tunes again."""
+        self._backbone_frozen = False
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
+    def train(self, mode=True):
+        """Override so a frozen backbone's BatchNorm layers stay in eval mode even when the
+        rest of the model is asked to train -- see I3DStream above for the full rationale."""
+        super().train(mode)
+        if self._backbone_frozen:
+            for module in self.backbone.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.eval()
+        return self
+
+
 class Identity(nn.Module):
     """
     A placeholder identity operator that is argument-insensitive.

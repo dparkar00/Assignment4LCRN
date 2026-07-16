@@ -39,7 +39,7 @@ from video_datasets import (VideoDataset, TwoStreamVideoDataset, load_dataset,
                              dataset_split, collate_fn_two_stream)
 from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
                     test_dloaders, preprocess_video_flow, dataloader_kwargs, NUM_WORKERS)
-from models import LRCN, TwoStreamI3D
+from models import LRCN, TwoStreamI3D, X3DStream
 from train import train
 from test import predict_probs  # pylint: disable=wrong-import-order
 # (pylint mistakes this repo's local test.py for the Python stdlib 'test' package by name)
@@ -60,7 +60,7 @@ def args_parser():
         -fpv/--fr_per_vid: Number of frames per video to consider (default 16).
         -nc/--n_classes: Number of classes for the classification task (required).
         -c/--ckpt: Path for loading a trained model checkpoint.
-        -mt/--model_type: Model type, '3dcnn', 'lrcn', or 'i3d_two_stream' (default 'lrcn').
+        -mt/--model_type: Model type, '3dcnn', 'lrcn', 'i3d_two_stream', or 'x3d' (default 'lrcn').
         -cnn/--cnn_backbone: Backbone CNN for 2D feature extraction (default 'resnet34').
         -p/--pretrained: Whether to use a pretrained CNN backbone (default True).
         -rhs/--rnn_hidden_size: Number of neurons in the RNN/LSTM hidden layer (default 100).
@@ -94,7 +94,8 @@ def args_parser():
                          help='Number of classes for the classification task')
 
     parser.add_argument('-c', '--ckpt', help='Path for loading trained model checkpoints')
-    parser.add_argument('-mt', '--model_type', default='lrcn', help='3D CNN or LRCN')
+    parser.add_argument('-mt', '--model_type', default='lrcn',
+                         help="'lrcn', '3dcnn', 'i3d_two_stream', or 'x3d'")
     parser.add_argument('-cnn', '--cnn_backbone', default='resnet34',
                          help='2D CNN backbone - options: resnet18, resnet34, resnet50, '
                               'resnet101, resnet152')
@@ -143,8 +144,8 @@ def args_parser():
 
 def build_model(args):
     """
-    Instantiate the model specified by args: TwoStreamI3D for two-stream mode, otherwise the
-    LRCN baseline.
+    Instantiate the model specified by args: TwoStreamI3D for two-stream mode, X3DStream for
+    the single-stream X3D mode, otherwise the LRCN baseline.
 
     Args:
         args (argparse.Namespace): Parsed command-line arguments.
@@ -154,6 +155,8 @@ def build_model(args):
     """
     if args.model_type == 'i3d_two_stream':
         return TwoStreamI3D(n_classes=args.n_classes, pretrained=args.pretrained)
+    if args.model_type == 'x3d':
+        return X3DStream(n_classes=args.n_classes, pretrained=args.pretrained)
     return LRCN(hidden_size=args.rnn_hidden_size, n_layers=args.rnn_n_layers,
                 dropout_rate=args.dropout, n_classes=args.n_classes,
                 pretrained=args.pretrained, cnn_model=args.cnn_backbone)
@@ -253,13 +256,14 @@ def _build_eval_dataloader(args, ts_split, val_ts_transforms, use_random):
 
 def run_eval(args, model, device, val_ts_transforms):  # pylint: disable=too-many-locals
     """
-    Eval mode: load the saved test split, load the checkpoint, and report overall test
-    accuracy -- optionally using multi-clip test-time averaging (see --tta_clips): several
+    Eval mode: load the saved test split, load the checkpoint, and report overall test loss
+    and accuracy -- optionally using multi-clip test-time averaging (see --tta_clips): several
     differently-sampled temporal clips per video are each run through the model, and their
     predicted probabilities are averaged before taking the final argmax. This reduces the
     variance of judging each video from a single arbitrary clip, and is standard practice for
     evaluating video classifiers (not a shortcut -- it's how many published benchmark numbers
-    are actually computed).
+    are actually computed). Test loss/accuracy are logged to a dedicated wandb eval run unless
+    --no_wandb is set, alongside the train/val metrics already logged during training.
     """
     splits = np.load('./splits.npy', allow_pickle=True)
     ts_split = splits.item()['test']
@@ -288,9 +292,29 @@ def run_eval(args, model, device, val_ts_transforms):  # pylint: disable=too-man
 
     avg_probs = avg_probs / n_clips
     preds = avg_probs.argmax(axis=1)
-    accuracy = float((preds == np.array(targets)).mean())
+    targets_arr = np.array(targets)
+    accuracy = float((preds == targets_arr).mean())
+    # NLL loss computed from the same averaged probabilities used for the accuracy figure above,
+    # so the reported test loss and test accuracy are two views of the identical final prediction
+    # (not, say, loss averaged separately across TTA passes while accuracy uses the average).
+    test_loss = float(-np.mean(np.log(avg_probs[np.arange(len(targets_arr)), targets_arr] + 1e-8)))
 
-    print(f'The overall test accuracy is {100 * accuracy:.4f}% (tta_clips={n_clips}).')
+    print(f'Test loss: {test_loss:.6f}, test accuracy: {100 * accuracy:.4f}% '
+          f'(tta_clips={n_clips}).')
+
+    if not args.no_wandb:
+        # A separate, dedicated eval run: --mode eval is typically a distinct process/invocation
+        # from training (e.g. run after training finishes, possibly much later, sometimes on a
+        # different checkpoint), so it gets its own wandb run rather than trying to resume the
+        # training run's session across processes. This is what actually gives you "evidence of
+        # performance on weights and biases for loss/accuracy for train/test/val" -- train/val
+        # were already logged during training; this is the test half.
+        eval_run_name = f'{args.run_name}-eval' if args.run_name else None
+        wandb.init(project=args.wandb_project, name=eval_run_name, config=vars(args),
+                   job_type='eval')
+        wandb.log({'test_loss': test_loss, 'test_accuracy': accuracy, 'tta_clips': n_clips})
+        wandb.finish()
+
     # For a detailed per-class breakdown, pass (targets, preds.tolist()) to get_test_report /
     # get_confusion_matrix from test.py.
 

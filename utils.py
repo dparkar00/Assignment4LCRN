@@ -240,8 +240,9 @@ def transform_stats(model='lrcn'):
         h, w = 112, 112
         mean = [0.43216, 0.394666, 0.37645]
         std = [0.22803, 0.22145, 0.216989]
-    elif model in ('i3d', 'i3d_two_stream'):
-        # Kinetics-400 normalization stats used by the pytorchvideo I3D-R50 checkpoint.
+    elif model in ('i3d', 'i3d_two_stream', 'x3d'):
+        # Kinetics-400 normalization stats shared by pytorchvideo's Kinetics-pretrained
+        # checkpoints (I3D-R50, X3D, etc).
         h, w = 224, 224
         mean = [0.45, 0.45, 0.45]
         std = [0.225, 0.225, 0.225]
