@@ -158,10 +158,6 @@ def args_parser():
                               'this and evaluates a single deterministic clip per video '
                               '(default 1).')
 
-    # X3D variant argument
-    parser.add_argument('-x3dv', '--x3d_variant', default='x3d_m',
-                         help="X3D variant: 'x3d_xs', 'x3d_s', 'x3d_m', 'x3d_l'")
-
     return parser.parse_args()
 
 
@@ -179,8 +175,7 @@ def build_model(args):
     if args.model_type == 'i3d_two_stream':
         return TwoStreamI3D(n_classes=args.n_classes, pretrained=args.pretrained)
     if args.model_type == 'x3d':
-        return X3DStream(n_classes=args.n_classes, pretrained=args.pretrained,
-                         variant=args.x3d_variant)
+        return X3DStream(n_classes=args.n_classes, pretrained=args.pretrained)
     return LRCN(hidden_size=args.rnn_hidden_size, n_layers=args.rnn_n_layers,
                 dropout_rate=args.dropout, n_classes=args.n_classes,
                 pretrained=args.pretrained, cnn_model=args.cnn_backbone)
