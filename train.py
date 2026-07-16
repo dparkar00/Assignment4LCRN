@@ -115,6 +115,18 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         if current_lr != get_learning_rate(optimizer):
             print('Loading best model weights!')
             model.load_state_dict(best_model_wts)
+            # Also reset the optimizer's per-parameter momentum state (AdamW's exp_avg/
+            # exp_avg_sq). Without this, those running estimates -- computed from gradients
+            # of the DIFFERENT (more overfit) weight trajectory that existed right before the
+            # reload -- get applied to gradients from the newly-reloaded weights on the very
+            # next step, a stale-momentum mismatch right when the lower LR is meant to
+            # stabilize training, not destabilize it. Clearing optimizer.state (while leaving
+            # param_groups, i.e. the LR/weight_decay settings, untouched) makes AdamW
+            # reinitialize these from zero on the next step, as if starting fresh at the
+            # reloaded weights.
+            for param_group in optimizer.param_groups:
+                for param in param_group['params']:
+                    optimizer.state[param] = {}
 
         if use_wandb:
             log_dict = {
