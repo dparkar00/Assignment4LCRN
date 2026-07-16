@@ -84,7 +84,7 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device,
         current_lr = get_learning_rate(optimizer)
         all_lrs = ', '.join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
         print(f'Epoch {epoch+1}/{n_epochs}; '
-              f'Current learning rate(s) [backbone, head, ...]: {all_lrs}')
+              f'Current learning rate(s) [backbone x2, head x2 (decay/no-decay)]: {all_lrs}')
 
         # Training phase
         model.train()
