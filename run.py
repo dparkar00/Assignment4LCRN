@@ -138,6 +138,19 @@ def args_parser():
                               'against occasional large-gradient batches destabilizing '
                               'training, particularly relevant since optimizer momentum now '
                               'resets on every LR drop (default 5.0).')
+    parser.add_argument('-lrp', '--lr_patience', type=int, default=5,
+                         help='Epochs with no val-loss improvement before the LR scheduler '
+                              'halves the learning rate (default 5).')
+    parser.add_argument('-mlr', '--min_lr', type=float, default=1e-6,
+                         help="Floor on the HEAD learning rate the scheduler won't decay "
+                              "below (backbone's floor is scaled by --backbone_lr_factor to "
+                              "match). Prevents repeated LR drops from decaying training into "
+                              "a near-frozen state that wastes epoch budget (default 1e-6).")
+    parser.add_argument('-ls', '--label_smoothing', type=float, default=0.1,
+                         help='Label smoothing factor for CrossEntropyLoss (0 disables it). '
+                              'Not applied to i3d_two_stream, which uses NLLLoss instead -- '
+                              "PyTorch's label_smoothing is only implemented for "
+                              'CrossEntropyLoss (default 0.1).')
 
     parser.add_argument('-tta', '--tta_clips', type=int, default=1,
                          help='Number of temporal clips to sample per test video and average '
@@ -237,11 +250,14 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):  # pylint:
                                            tr_transforms, val_ts_transforms)
 
     # TwoStreamI3D.forward returns log-probabilities (fusion happens in probability space), so
-    # it pairs with NLLLoss rather than CrossEntropyLoss (which expects raw logits).
+    # it pairs with NLLLoss rather than CrossEntropyLoss (which expects raw logits). NLLLoss
+    # doesn't support label_smoothing (only CrossEntropyLoss does, since smoothing is applied
+    # as part of its internal softmax computation) -- label smoothing is therefore only active
+    # for the CrossEntropyLoss path (X3D, LRCN, 3dcnn), not i3d_two_stream.
     if args.model_type == 'i3d_two_stream':
         loss_func = nn.NLLLoss(reduction='sum')
     else:
-        loss_func = nn.CrossEntropyLoss(reduction='sum')
+        loss_func = nn.CrossEntropyLoss(reduction='sum', label_smoothing=args.label_smoothing)
 
     backbone_decay, backbone_no_decay = split_decay_params(model.backbone_parameters())
     head_decay, head_no_decay = split_decay_params(model.head_parameters())
@@ -252,7 +268,16 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):  # pylint:
         {'params': head_decay, 'lr': args.learning_rate, 'weight_decay': args.weight_decay},
         {'params': head_no_decay, 'lr': args.learning_rate, 'weight_decay': 0.0},
     ])
-    lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
+    # min_lr stops the scheduler decaying a group's LR below a useful floor -- without this,
+    # repeated drops with no improvement (as seen in a real run: 6 drops over 80 epochs, LR
+    # ending up 256x smaller than it started, with zero accuracy gain after the first drop)
+    # burn epoch budget training at an LR too small to meaningfully update weights. The floor
+    # is scaled per group to preserve the backbone/head LR ratio, matching how the groups were
+    # constructed above.
+    backbone_min_lr = args.min_lr * args.backbone_lr_factor
+    lr_scheduler = ReduceLROnPlateau(
+        opt, mode='min', factor=0.5, patience=args.lr_patience,
+        min_lr=[backbone_min_lr, backbone_min_lr, args.min_lr, args.min_lr])
     os.makedirs("./models", exist_ok=True)
 
     if args.freeze_backbone_until > 0:
