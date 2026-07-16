@@ -162,6 +162,35 @@ def build_model(args):
                 pretrained=args.pretrained, cnn_model=args.cnn_backbone)
 
 
+def split_decay_params(parameters):
+    """
+    Split parameters into 'decay' (weight matrices) and 'no_decay' (biases and BatchNorm
+    scale/shift) groups, by tensor dimensionality: weight matrices in Linear/Conv layers are
+    2+ dimensional, while biases and BatchNorm's learnable gamma/beta are always 1-dimensional.
+
+    Weight decay should not be applied to biases or normalization-layer scale/shift parameters
+    -- this is standard practice in virtually every modern training recipe. Applying it to
+    BatchNorm's gamma in particular actively fights that parameter's purpose (learning how much
+    to scale normalized activations), rather than just being a no-op; applying it to biases adds
+    noise without the "large weights indicate overfitting" rationale that motivates decaying
+    weight matrices in the first place.
+
+    Args:
+        parameters (list): List of nn.Parameter tensors (e.g. from a model's
+                            backbone_parameters()/head_parameters()).
+
+    Returns:
+        tuple: (decay_params, no_decay_params), each a list of parameters.
+    """
+    decay, no_decay = [], []
+    for param in parameters:
+        if param.ndim <= 1:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return decay, no_decay
+
+
 def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_transforms):
     """
     Build the training and validation DataLoaders, branching on model_type since two-stream
@@ -186,7 +215,7 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
     return train_val_dloaders(tr_dataset, val_dataset, args.batch_size, args.model_type)
 
 
-def run_train(args, model, device, tr_transforms, val_ts_transforms):
+def run_train(args, model, device, tr_transforms, val_ts_transforms):  # pylint: disable=too-many-locals
     """
     Train mode: load and split the dataset, save the splits, build dataloaders, and run the
     training loop, logging metrics to Weights & Biases unless --no_wandb is set.
@@ -208,10 +237,15 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
     else:
         loss_func = nn.CrossEntropyLoss(reduction='sum')
 
+    backbone_decay, backbone_no_decay = split_decay_params(model.backbone_parameters())
+    head_decay, head_no_decay = split_decay_params(model.head_parameters())
+    backbone_lr = args.learning_rate * args.backbone_lr_factor
     opt = optim.AdamW([
-        {'params': model.backbone_parameters(), 'lr': args.learning_rate * args.backbone_lr_factor},
-        {'params': model.head_parameters(), 'lr': args.learning_rate},
-    ], weight_decay=args.weight_decay)
+        {'params': backbone_decay, 'lr': backbone_lr, 'weight_decay': args.weight_decay},
+        {'params': backbone_no_decay, 'lr': backbone_lr, 'weight_decay': 0.0},
+        {'params': head_decay, 'lr': args.learning_rate, 'weight_decay': args.weight_decay},
+        {'params': head_no_decay, 'lr': args.learning_rate, 'weight_decay': 0.0},
+    ])
     lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
     os.makedirs("./models", exist_ok=True)
 
