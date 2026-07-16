@@ -1,9 +1,6 @@
 #!/bin/bash
-python run.py \
+!python run.py \
+    --frame_dir {frame_dir} \
     --ckpt ./models/best_model_wts.pt \
-    --model_type lrcn \
-    --n_classes 51 \
-    --batch_size 4 \
-    --mode eval \
-    --wandb_project lrcn-baseline \
-    --run_name lrcn-fixed-eval
+    --model_type x3d --n_classes 51 --batch_size 24 --mode eval \
+    --tta_clips 1
