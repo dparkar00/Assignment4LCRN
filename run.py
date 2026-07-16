@@ -41,7 +41,7 @@ from utils import (transform_stats, compose_data_transforms, train_val_dloaders,
                     test_dloaders, preprocess_video_flow, dataloader_kwargs, NUM_WORKERS)
 from models import LRCN, TwoStreamI3D
 from train import train
-from test import test  # pylint: disable=wrong-import-order
+from test import predict_probs  # pylint: disable=wrong-import-order
 # (pylint mistakes this repo's local test.py for the Python stdlib 'test' package by name)
 
 
@@ -132,6 +132,12 @@ def args_parser():
                          help="Backbone LR = learning_rate * backbone_lr_factor; head LR = "
                               "learning_rate (e.g. 0.1 for a 10x lower backbone LR)")
 
+    parser.add_argument('-tta', '--tta_clips', type=int, default=1,
+                         help='Number of temporal clips to sample per test video and average '
+                              'predictions over (multi-clip test-time evaluation). 1 disables '
+                              'this and evaluates a single deterministic clip per video '
+                              '(default 1).')
+
     return parser.parse_args()
 
 
@@ -163,7 +169,7 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
     """
     if args.model_type == 'i3d_two_stream':
         tr_dataset = TwoStreamVideoDataset(tr_split, args.flow_dir, args.fr_per_vid,
-                                            tr_transforms, tr_transforms)
+                                            tr_transforms, tr_transforms, training=True)
         val_dataset = TwoStreamVideoDataset(val_split, args.flow_dir, args.fr_per_vid,
                                              val_ts_transforms, val_ts_transforms)
         train_dl = DataLoader(tr_dataset, batch_size=args.batch_size, shuffle=True,
@@ -172,7 +178,7 @@ def build_train_dataloaders(args, tr_split, val_split, tr_transforms, val_ts_tra
                              collate_fn=collate_fn_two_stream, **dataloader_kwargs())
         return {'train': train_dl, 'val': val_dl}
 
-    tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms)
+    tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms, training=True)
     val_dataset = VideoDataset(val_split, args.fr_per_vid, val_ts_transforms)
     return train_val_dloaders(tr_dataset, val_dataset, args.batch_size, args.model_type)
 
@@ -223,32 +229,70 @@ def run_train(args, model, device, tr_transforms, val_ts_transforms):
         wandb.finish()
 
 
-def run_eval(args, model, device, val_ts_transforms):
+def _build_eval_dataloader(args, ts_split, val_ts_transforms, use_random):
     """
-    Eval mode: load the saved test split, build a test dataloader, load the checkpoint, and
-    report overall test accuracy.
+    Build a test DataLoader for one evaluation pass, branching on model_type.
+
+    Args:
+        use_random (bool): If True, the dataset samples a random temporal window per video
+                            (used for multi-clip TTA passes after the first); if False,
+                            samples the deterministic center-of-segment window.
+
+    Returns:
+        torch.utils.data.DataLoader
+    """
+    if args.model_type == 'i3d_two_stream':
+        ts_dataset = TwoStreamVideoDataset(ts_split, args.flow_dir, args.fr_per_vid,
+                                            val_ts_transforms, val_ts_transforms,
+                                            training=use_random)
+        return DataLoader(ts_dataset, batch_size=2 * args.batch_size, shuffle=False,
+                           collate_fn=collate_fn_two_stream, **dataloader_kwargs())
+    ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms, training=use_random)
+    return test_dloaders(ts_dataset, args.batch_size, args.model_type)['test']
+
+
+def run_eval(args, model, device, val_ts_transforms):  # pylint: disable=too-many-locals
+    """
+    Eval mode: load the saved test split, load the checkpoint, and report overall test
+    accuracy -- optionally using multi-clip test-time averaging (see --tta_clips): several
+    differently-sampled temporal clips per video are each run through the model, and their
+    predicted probabilities are averaged before taking the final argmax. This reduces the
+    variance of judging each video from a single arbitrary clip, and is standard practice for
+    evaluating video classifiers (not a shortcut -- it's how many published benchmark numbers
+    are actually computed).
     """
     splits = np.load('./splits.npy', allow_pickle=True)
     ts_split = splits.item()['test']
     ts_split = [(sample[0], int(sample[1])) for sample in ts_split]
 
-    if args.model_type == 'i3d_two_stream':
-        ts_dataset = TwoStreamVideoDataset(ts_split, args.flow_dir, args.fr_per_vid,
-                                            val_ts_transforms, val_ts_transforms)
-        dataloaders = {'test': DataLoader(ts_dataset, batch_size=2 * args.batch_size,
-                                           shuffle=False, collate_fn=collate_fn_two_stream,
-                                           **dataloader_kwargs())}
-    else:
-        ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms)
-        dataloaders = test_dloaders(ts_dataset, args.batch_size, args.model_type)
-
     model.load_state_dict(torch.load(args.ckpt))
     model.to(device)
-    _, _, accuracy = test(model, dataloaders['test'], device)
+    model.eval()
 
-    print(f'The overall test accuracy is {100 * accuracy:.4f}%.')
-    # For a detailed per-class breakdown, capture (targets, outputs) from test() above and pass
-    # them to get_test_report / get_confusion_matrix from test.py.
+    n_clips = max(1, args.tta_clips)
+    is_log_prob = args.model_type == 'i3d_two_stream'
+    avg_probs, targets = None, None
+
+    for clip_idx in range(n_clips):
+        # The first pass uses the deterministic center clip; if doing multi-clip TTA,
+        # subsequent passes each sample a different random temporal window.
+        dataloader = _build_eval_dataloader(args, ts_split, val_ts_transforms,
+                                             use_random=(n_clips > 1 and clip_idx > 0))
+        pass_probs, pass_targets = predict_probs(model, dataloader, device, is_log_prob)
+        if avg_probs is None:
+            avg_probs = pass_probs
+            targets = pass_targets
+        else:
+            avg_probs = avg_probs + pass_probs
+        print(f'TTA pass {clip_idx + 1}/{n_clips} complete.')
+
+    avg_probs = avg_probs / n_clips
+    preds = avg_probs.argmax(axis=1)
+    accuracy = float((preds == np.array(targets)).mean())
+
+    print(f'The overall test accuracy is {100 * accuracy:.4f}% (tta_clips={n_clips}).')
+    # For a detailed per-class breakdown, pass (targets, preds.tolist()) to get_test_report /
+    # get_confusion_matrix from test.py.
 
 
 def run_preprocess_flow(args):

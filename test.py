@@ -8,14 +8,62 @@ report, and compute a multilabel confusion matrix for all classes.
 Functions:
     - test: Evaluates the model on a test DataLoader and returns the ground truth labels,
       predicted labels, and overall accuracy.
+    - predict_probs: Returns per-sample class probabilities (not just the argmax prediction),
+      used for multi-clip test-time averaging (see run.py's run_eval).
     - get_test_report: Generates a classification report using scikit-learn's
       classification_report.
     - get_confusion_matrix: Computes a multilabel confusion matrix for each class.
 """
 
+import numpy as np
 import torch
 from tqdm import tqdm
 from sklearn.metrics import classification_report, multilabel_confusion_matrix
+
+
+def predict_probs(model, dataloader, device, is_log_prob):
+    """
+    Run the model over a DataLoader and return per-sample class PROBABILITIES (not just the
+    argmax prediction) and targets, in dataloader iteration order.
+
+    Used for multi-clip test-time averaging: each call samples one clip per video, and
+    run.py's run_eval calls this multiple times (each pass sampling a different random
+    temporal window of each test video) and averages the resulting probabilities before taking
+    the final argmax -- standard practice for evaluating video classifiers, since judging
+    accuracy on a single arbitrary clip per video is higher-variance than averaging over
+    several.
+
+    Args:
+        model (torch.nn.Module): The trained model, already moved to device and in eval mode.
+        dataloader (torch.utils.data.DataLoader): DataLoader to run inference over. Must NOT
+                                                    shuffle, so sample order is consistent
+                                                    across repeated calls (needed to align and
+                                                    average probabilities across passes).
+        device (torch.device): Device to run inference on.
+        is_log_prob (bool): True if the model's forward() returns log-probabilities (e.g.
+                             TwoStreamI3D, which fuses two streams in probability space), False
+                             if it returns raw logits (e.g. LRCN, paired with CrossEntropyLoss).
+
+    Returns:
+        tuple: (probs, targets)
+            - probs (np.ndarray): Array of shape (n_samples, n_classes) of class probabilities.
+            - targets (list): Ground truth labels, same order as probs.
+    """
+    amp_enabled = device.type == 'cuda'
+    batch_probs, targets = [], []
+    with torch.no_grad():
+        for x_batch, y_batch in tqdm(dataloader):
+            y_batch = y_batch.to(device)
+            if isinstance(x_batch, (tuple, list)):
+                x_batch = tuple(x.to(device) for x in x_batch)
+            else:
+                x_batch = x_batch.to(device)
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                output = model(*x_batch) if isinstance(x_batch, tuple) else model(x_batch)
+            probs = torch.exp(output) if is_log_prob else torch.softmax(output, dim=1)
+            batch_probs.append(probs.detach().cpu().numpy())
+            targets.extend(y_batch.detach().cpu().numpy().tolist())
+    return np.concatenate(batch_probs, axis=0), targets
 
 
 def test(model, dataloader, device):

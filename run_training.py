@@ -134,7 +134,7 @@ def trainer(args):  # pylint: disable=too-many-locals
     tr_transforms, val_ts_transforms = compose_data_transforms(h, w, mean, std)
 
     # Create PyTorch Datasets for each split
-    tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms)
+    tr_dataset = VideoDataset(tr_split, args.fr_per_vid, tr_transforms, training=True)
     val_dataset = VideoDataset(val_split, args.fr_per_vid, val_ts_transforms)
     ts_dataset = VideoDataset(ts_split, args.fr_per_vid, val_ts_transforms)
 

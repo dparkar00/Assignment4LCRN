@@ -23,6 +23,45 @@ from torch.nn.utils.rnn import pad_sequence
 from torchvision import transforms as torch_transforms
 
 
+def _sample_frame_indices(n_frames, fpv, random_sample):
+    """
+    Choose fpv frame indices out of n_frames total frames available for a clip.
+
+    If random_sample is True (training), divides the video into fpv equal-width segments and
+    picks a uniformly random frame within each segment (TSN-style random temporal sampling).
+    This means the same video contributes a DIFFERENT temporal snapshot on every epoch, which
+    is real data augmentation that spatial-only transforms (flip/crop) can't provide -- without
+    this, every epoch loads the exact same fpv frames for a given video, so with a small number
+    of independent training videos per class the model effectively only ever sees one temporal
+    "view" of each one.
+
+    If random_sample is False (validation/test), deterministically picks the frame closest to
+    the center of each segment, so evaluation is reproducible across runs/checkpoints.
+
+    Args:
+        n_frames (int): Number of frames available for this video.
+        fpv (int): Number of frames to sample.
+        random_sample (bool): Sample randomly (train) or deterministically (val/test).
+
+    Returns:
+        np.ndarray: Array of fpv frame indices, each in [0, n_frames). Indices repeat if
+                    n_frames < fpv, same as the previous fixed linspace behavior.
+    """
+    if n_frames <= 0:
+        return np.array([], dtype=int)
+    bounds = np.linspace(0, n_frames, fpv + 1)
+    indices = []
+    for i in range(fpv):
+        lo = int(bounds[i])
+        hi = max(lo, int(bounds[i + 1]) - 1)
+        hi = min(hi, n_frames - 1)
+        if random_sample:
+            indices.append(np.random.randint(lo, hi + 1))
+        else:
+            indices.append((lo + hi) // 2)
+    return np.array(indices)
+
+
 class VideoDataset(Dataset):
     """
     PyTorch Dataset class for loading video data from directories of frame images.
@@ -36,11 +75,16 @@ class VideoDataset(Dataset):
         fr_per_vid (int): Number of frames per video to load (images are taken in order).
         transforms (callable, optional): A function/transform to apply to each frame image
                                           (e.g., resizing, normalization).
+        training (bool, optional): If True, sample frames randomly per segment each epoch
+                                    (real temporal augmentation). If False, sample the
+                                    deterministic center frame of each segment (reproducible
+                                    evaluation). Default is False.
     """
-    def __init__(self, vid_dataset, fr_per_vid, transforms=None):
+    def __init__(self, vid_dataset, fr_per_vid, transforms=None, training=False):
         self.dataset = vid_dataset
         self.fpv = fr_per_vid
         self.transforms = transforms
+        self.training = training
 
     def __len__(self):
         """Return the number of video samples in the dataset."""
@@ -58,14 +102,14 @@ class VideoDataset(Dataset):
             tuple: (frames_tensor, label) where frames_tensor is a tensor of shape (T, C, H, W)
                    with T == fr_per_vid and label is an integer.
         """
-        # Get all JPEG frame paths from the video directory and uniformly sample exactly
-        # fpv of them. linspace is used regardless of whether the video has more or fewer
-        # frames than fpv: when there are fewer, indices repeat so every clip in a batch still
-        # comes out to exactly fpv frames (a fixed-size 3D-CNN batch can't stack clips of
-        # different lengths).
+        # Get all JPEG frame paths from the video directory and sample exactly fpv of them:
+        # randomly per segment during training (temporal augmentation), deterministically for
+        # eval. Either way, indices repeat if the video has fewer frames than fpv, so every
+        # clip in a batch still comes out to exactly fpv frames (a fixed-size 3D-CNN batch
+        # can't stack clips of different lengths).
         fr_paths = sorted(glob.glob(self.dataset[idx][0] + '/*.jpg'))
         if fr_paths:
-            sample_idx = np.linspace(0, len(fr_paths) - 1, self.fpv).astype(int)
+            sample_idx = _sample_frame_indices(len(fr_paths), self.fpv, self.training)
             fr_paths = [fr_paths[i] for i in sample_idx]
 
         # Open images using PIL
@@ -108,30 +152,36 @@ class TwoStreamVideoDataset(Dataset):
         fr_per_vid (int): Number of frames per video to load.
         rgb_transforms (callable, optional): Transform applied to each RGB frame.
         flow_transforms (callable, optional): Transform applied to each flow frame.
+        training (bool, optional): If True, sample frames randomly per segment each epoch
+                                    (real temporal augmentation). If False, sample the
+                                    deterministic center frame of each segment (reproducible
+                                    evaluation). Default is False.
     """
-    def __init__(self, vid_dataset, flow_dir, fr_per_vid, rgb_transforms=None,
-                 flow_transforms=None):
+    def __init__(self, vid_dataset, flow_dir, fr_per_vid, rgb_transforms=None,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                 flow_transforms=None, training=False):
         self.dataset = vid_dataset
         self.flow_dir = flow_dir
         self.fpv = fr_per_vid
         self.rgb_transforms = rgb_transforms
         self.flow_transforms = flow_transforms
+        self.training = training
 
     def __len__(self):
         """Return the number of video samples in the dataset."""
         return len(self.dataset)
 
-    def _load_clip(self, dir_path, transforms, clip_seed):
-        """Load up to fpv uniformly-sampled, temporally-sorted frames from dir_path, applying
-        the given random seed before every frame's transform so the whole clip gets one
-        consistent augmentation decision (shared across streams via a common clip_seed)."""
+    def _load_clip(self, dir_path, transforms, clip_seed, sample_idx):
+        """Load the frames at sample_idx (precomputed once per video and shared between the
+        RGB and flow calls, so both streams describe the same temporal moments) from dir_path,
+        applying the given random seed before every frame's transform so the whole clip gets
+        one consistent spatial augmentation decision."""
         fr_paths = sorted(glob.glob(dir_path + '/*.jpg'))
-        if fr_paths:
-            sample_idx = np.linspace(0, len(fr_paths) - 1, self.fpv).astype(int)
-            fr_paths = [fr_paths[i] for i in sample_idx]
-        fr_imgs = [Image.open(fr_path) for fr_path in fr_paths]
-        if not fr_imgs:
+        if not fr_paths or len(sample_idx) == 0:
             return torch.empty(0)
+        fr_paths = [fr_paths[i] for i in sample_idx if i < len(fr_paths)]
+        if not fr_paths:
+            return torch.empty(0)
+        fr_imgs = [Image.open(fr_path) for fr_path in fr_paths]
         fr_imgs_trans = []
         for fr_img in fr_imgs:
             torch.manual_seed(clip_seed)
@@ -156,13 +206,20 @@ class TwoStreamVideoDataset(Dataset):
         rel_path = os.path.join(*rgb_path.rstrip('/').split(os.sep)[-2:])
         flow_path = os.path.join(self.flow_dir, rel_path)
 
+        # Pick ONE set of temporal indices for BOTH streams -- an index must refer to the same
+        # underlying moment in the RGB and flow sequences (they're kept frame-count-matched by
+        # preprocess_video_flow), so sampling each stream independently would pair an RGB frame
+        # from one moment with flow describing a different moment entirely.
+        n_frames = len(glob.glob(rgb_path + '/*.jpg'))
+        sample_idx = _sample_frame_indices(n_frames, self.fpv, self.training)
+
         # Use the SAME seed for both streams so any random flip/affine is applied identically
         # to the RGB clip and its corresponding flow clip -- otherwise the two streams could
         # end up spatially misaligned (e.g. RGB flipped, flow not), which breaks the
         # correspondence between appearance and motion that two-stream fusion relies on.
         clip_seed = torch.seed()
-        rgb_clip = self._load_clip(rgb_path, self.rgb_transforms, clip_seed)
-        flow_clip = self._load_clip(flow_path, self.flow_transforms, clip_seed)
+        rgb_clip = self._load_clip(rgb_path, self.rgb_transforms, clip_seed, sample_idx)
+        flow_clip = self._load_clip(flow_path, self.flow_transforms, clip_seed, sample_idx)
 
         return rgb_clip, flow_clip, label
 
