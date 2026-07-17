@@ -3,8 +3,72 @@
 This repository was originally a working-but-flawed video classification pipeline (LRCN: ResNet + LSTM, trained on HMDB51). The assignment brief was explicit that the codebase contained **a data leak** and **a critically significant bug**. This README documents what was found and fixed, the model-level improvements made on top of the corrected base, and how to run the
 project.
 
-## Table of Contents
 
+
+
+## Dataset Preparation
+
+### Step 0: Download and Unzip Dataset
+
+1. **Download Dataset:**  
+   Download the HMDB51 dataset from [Kaggle](https://www.kaggle.com/datasets/easonlll/hmdb51). This dataset contains videos of 51 different human action classes.
+
+2. **Unzip and Organize:**  
+   Unzip the downloaded dataset. The expected folder structure should be as follows:
+   
+        - HMDB51
+            - Action_Class1
+            - Action_Class2
+            ... ... ... ...
+            - Action_Class51
+
+Each subdirectory represents a different action class.
+
+---
+
+## Environment Setup
+
+1. **Python Version:**  
+This project requires Python 3.7 or higher.
+
+2. **Dependencies:**  
+Install the required Python packages by running:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Key Libraries
+
+- **PyTorch**
+- **torchvision**
+- **OpenCV**
+- **scikit-learn**
+- **tqdm**
+- **numpy**
+- **Pillow**
+
+## Hardware Requirements
+
+A CUDA-enabled GPU is recommended for training. The code automatically detects GPU availability.
+
+---
+
+## Preprocessing and Frame Extraction
+
+Before training, the raw video files must be converted into frame sequences. The preprocessing module includes functions for:
+
+### Uniform Frame Sampling
+
+- The `get_frames` function uses OpenCV to sample a fixed number of frames per video.
+
+### Saving Frames to Disk
+
+- The `store_frames` function writes the extracted frames as JPEG images.
+
+Integrate these functions into a preprocessing script (e.g., `preprocess.py`) to convert all videos into folders of extracted frames. The resulting folder structure should mirror the original dataset structure:
+
+## Table of Contents
 - [Bugs Fixed and Data Leak](#bugs-fixed-and-data-leak)
 - [Model-Level Improvements](#model-level-improvements)
 - [Preprocessing and Frame Extraction](#preprocessing-and-frame-extraction)
@@ -54,7 +118,7 @@ share a source video, letting clips of the same video end up split across train 
    the current design, verified with an adversarial stress test.
 
 ### Other bugs found and fixed
-(some were suggested by LLM, as I was stuck and needed help finding the bugs affecting training)
+(some were suggested by LLM, as I was stuck and needed help finding the bugs affecting training when I was stuck at 40% for accuracy.)
 
 | Bug | File | Description |
 |---|---|---|
@@ -74,7 +138,7 @@ share a source video, letting clips of the same video end up split across train 
 | Weight decay applied to BatchNorm and bias parameters | `run.py` | `weight_decay` applied uniformly to every parameter; fixed by splitting into decay/no-decay parameter groups by tensor dimensionality. |
 | LR scheduler could decay training into uselessness | `run.py` | Added a `min_lr` floor, because repeated unproductive LR drops could decay the rate. |
 
-Also, this is not a bug or model level improvement; but I increase the num_workers to allow parallelization operations to make training faster for me; as before, I was not getting convergence within 3-3.5 hours of training.
+Also, this is not a bug or model level improvement; but I increased the num_workers to allow parallelization operations to make training faster for me; as before, I was not getting convergence within 3-3.5 hours of training.
 
 ---
 
@@ -144,12 +208,24 @@ python run.py \
     --wandb_project hmdb51-x3d --run_name my-run
 ```
 
-Training loads the dataset, builds the class-balanced group split, optionally freezes the
-backbone for the first `--freeze_backbone_until` epochs, and runs the standard
-train/validate loop with AdamW, mixed-precision (AMP), gradient clipping, and a
-`ReduceLROnPlateau` scheduler with a `min_lr` floor. The best checkpoint (by validation
-accuracy) is saved to `./models/best_model_wts.pt` and uploaded to Weights & Biases whenever
-it improves. Pass `--no_wandb` to disable logging entirely.
+Training loads the dataset and builds the class-balanced, group-aware train/val/test split
+(saved to `splits.npy` so evaluation later reuses the exact same split). Parameters are split
+into four AdamW groups -- backbone-decay, backbone-no-decay, head-decay, head-no-decay -- so
+`--weight_decay` only applies to actual weight matrices, never BatchNorm scale/shift or
+biases; the backbone's two groups use `learning_rate * backbone_lr_factor`, the head's two
+use `learning_rate` directly. If `--freeze_backbone_until N` is set, the backbone is frozen
+(and its BatchNorm layers held in eval mode) for the first `N` epochs, training only the
+freshly-initialized classification head, then unfrozen. Each epoch runs a standard
+forward/backward pass under AMP autocast, with gradients clipped to `--grad_clip_norm` before
+the optimizer step. `ReduceLROnPlateau` watches validation loss and halves the learning rate
+(down to a `--min_lr` floor) after `--lr_patience` epochs with no improvement; whenever it
+does, the model reloads its best-so-far checkpoint and the optimizer's momentum state is
+cleared, so the next step doesn't apply momentum computed on a different, more-overfit weight
+trajectory to the reloaded weights. The checkpoint with the best validation accuracy is saved
+to `./models/best_model_wts.pt` and re-uploaded to Weights & Biases every time it improves.
+Pass `--no_wandb` to disable logging entirely.
+
+I found that this technique worked the best, since my model's best checkpoint sometimes increased after long epoch runs, (15+ steps), but I think this can be optimized further, so that it targets the problem of slow gains. I also think my optical flow implementation for 2stream 3DCNNs were incorrect, so that is why I decided to forgo going this route; since I switched, I have better test accuracy with X3D.
 
 ---
 
@@ -162,9 +238,8 @@ python run.py \
 ```
 
 Evaluation loads the saved test split and the specified checkpoint, then reports test loss
-and accuracy -- logged to a dedicated Weights & Biases eval run alongside the training run's
-train/val history. `--tta_clips` controls multi-clip test-time averaging (see Model-Level
-Improvements above for why this project's final configuration uses `1`, not a higher value).
+and accuracy, which is logged to a dedicated Weights & Biases eval run alongside the training run's
+train/val history. `--tta_clips` controls multi-clip test-time averaging, which was found not to be helpful but i left it implemented for testing purposesin my case, so I left this at eval to be set to 1. 
 
 ---
 
@@ -172,12 +247,12 @@ Improvements above for why this project's final configuration uses `1`, not a hi
 
 | File | Purpose |
 |---|---|
-| `run.py` | CLI entry point: argument parsing, model/optimizer construction, train/eval/preprocess-flow orchestration. |
+| `run.py` | entry point for argument parsing, model/optimizer construction, train/eval orchestration. |
 | `train.py` | Core training loop, loss/accuracy computation, gradient clipping, checkpointing. |
 | `test.py` | Test-set evaluation, multi-clip probability averaging, classification report/confusion matrix helpers. |
-| `models.py` | Model definitions: `LRCN`, `I3DStream`/`TwoStreamI3D`, `X3DStream`. |
+| `models.py` | Model definitions: `LRCN`, `I3DStream`/`TwoStreamI3D`, `X3DStream`; we only called X3D in our case, which is single-stream architecture. |
 | `video_datasets.py` | `VideoDataset`/`TwoStreamVideoDataset`, group-aware class-balanced `dataset_split`, collate functions. |
-| `utils.py` | Frame extraction, optical flow computation, data transforms, DataLoader construction. |
+| `utils.py` | Frame extraction, optical flow computation (used for I3D two stream not for this), data transforms, DataLoader construction. |
 | `run_training.py` | Simpler legacy entry point (LRCN-only, no wandb/freeze/clipping features). |
 | `requirements.txt` | Python dependencies. |
 
@@ -188,26 +263,31 @@ Improvements above for why this project's final configuration uses `1`, not a hi
 | Flag | Default | Description |
 |---|---|---|
 | `--frame_dir` | -- | Directory of extracted video frames. |
-| `--train_size` / `--test_size` | `0.7` / `0.1` | Split proportions (remainder is validation). |
+| `--train_size` / `--test_size` | `0.75` / `0.15` | Split proportions (remainder is validation). |
 | `--fr_per_vid` | `16` | Frames sampled per clip. |
-| `--n_classes` | required | Number of action classes. |
+| `--n_classes` | `51` | Number of action classes. |
 | `--ckpt` | -- | Checkpoint path (for `--mode eval`). |
-| `--model_type` |  `x3d`. |
-| `--mode` | required | `train`, `eval`, or `preprocess_flow`. |
-| `--batch_size` | required | Mini-batch size. |
-| `--learning_rate` | `2e4` | Head learning rate. |
+| `--model_type` | `x3d` | -- |
+| `--mode` | `train` | `train`, `eval`, or `preprocess_flow`. |
+| `--batch_size` | `24` | Mini-batch size. |
+| `--learning_rate` | `2e-4` | Head learning rate. |
 | `--weight_decay` | `1e-3` | Applied only to weight matrices, not BatchNorm/bias (see Bugs Fixed). |
-| `--n_epochs` | `30` | Training epochs. |
-| `--wandb_project` / `--run_name` | -- | Weights & Biases naming. |
+| `--n_epochs` | `150` | Training epochs. |
+| `--wandb_project` / `--run_name` | `hmdb51-x3d` / `x3d-backbone-lr-1.0` | Weights & Biases naming. |
 | `--no_wandb` | off | Disable W&B logging. |
-| `--freeze_backbone_until` | `0` | Epochs to keep the backbone frozen (0 = never). |
+| `--freeze_backbone_until` | `5` | Epochs to keep the backbone frozen (0 = never). |
 | `--backbone_lr_factor` | `1.0` | Backbone LR = `learning_rate * backbone_lr_factor`. Confirmed optimal at `1.0` (see Model-Level Improvements). |
 | `--grad_clip_norm` | `5.0` | Max gradient norm (0 disables). |
-| `--lr_patience` | `5` | Epochs of no improvement before the scheduler halves the LR. |
+| `--lr_patience` | `8` | Epochs of no improvement before the scheduler halves the LR. |
 | `--min_lr` | `1e-6` | Floor the scheduler won't decay the head LR below. |
 | `--label_smoothing` | `0.1` | CrossEntropyLoss label smoothing (not applied to `i3d_two_stream`). |
-| `--tta_clips` | `1` | Multi-clip test-time averaging at eval (was tested during this project, but found that it was best to just not implement it and leave this variable at 1). |
+| `--tta_clips` | `1` | Multi-clip test-time averaging at eval (was tested during this project, but found that it was best to just not implement it and left this variable at 1). |
+| Loss function | `nn.CrossEntropyLoss(reduction='sum', label_smoothing=0.1)` | Selected in `run_train` based on `model_type`; `x3d` (and `lrcn`/`3dcnn`) use `CrossEntropyLoss`, while `i3d_two_stream` uses `NLLLoss` instead (since its forward pass outputs log-probabilities (this was tested but not used for this training), and `NLLLoss` doesn't support `label_smoothing`) |
 
-#Conclusion
+# Conclusion
 
-I did not achieve 85% test accuracy, I was off by 8 points when I tested it. 
+I did not achieve 85% test accuracy. I achieved 78.81 I was off by 6 ish points when I tested it. There could be some hyperparameters that I did not tune well, but I think this is the best performance I reached with these hyperparameters set in training script. Furthermore, throughout my code, I have remnants of classes and functions for different architectures I tested but did not end up choosing for evaluation. The ones listed here for X3D were used during training, as I found that it aimts to determine how many parameters to use for efficient video recognition. In one of the papers for Module 7, it was mentioned that X3D iteratively expands 6 dimensions to find the optimal tradeoff to make the model larger with the best tradeoff; it trains with 30 tiny models that require less multiply add operations than training one large networks; this beats my previous architecture's accuracy, but gains are slow. This is seen as I experimented with the code, I needed more training for convergence, but even with more training, gains are very slow and only kick in after many epoch steps after a few decay steps.
+
+** Note: I have remnants of code from several different model architectures we discussed in class; they are not called during training or eval, they are just there in the repo, because I didn't want to risk deleting code that is currently working in case something breaks. This is why in some of my customization, I try to explain my code and why I chose certain hyperparameters to tune for this project.
+
+For this code, I ran it for 150 epochs on High Ram on A100 GPUs on colab; I cloned the repo in colab and set up the frame directory, then ran the python bash scripts for training and evaluation. Logging screenshots are attached to submission. 

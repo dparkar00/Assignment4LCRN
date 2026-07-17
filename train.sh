@@ -1,5 +1,5 @@
 #!/bin/bash
-!python run.py \
+python run.py \
     --frame_dir {frame_dir} \
     --train_size 0.75 --test_size 0.15 \
     --model_type x3d --n_classes 51 --fr_per_vid 16 \
