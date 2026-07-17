@@ -344,6 +344,18 @@ def run_eval(args, model, device, val_ts_transforms):  # pylint: disable=too-man
     is_log_prob = args.model_type == 'i3d_two_stream'
     avg_probs, targets = None, None
 
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        # Started here, before evaluation runs, not after -- wandb captures stdout into
+        # output.log for the duration the run is active, so initializing it only after
+        # evaluation finished (the original ordering) meant every console line from the
+        # actual evaluation (progress bars, "TTA pass N/M complete") was never captured,
+        # only the final summary numbers. Matches how training already does this correctly
+        # (wandb.init() there happens before the training loop).
+        eval_run_name = f'{args.run_name}-eval' if args.run_name else None
+        wandb.init(project=args.wandb_project, name=eval_run_name, config=vars(args),
+                   job_type='eval')
+
     for clip_idx in range(n_clips):
         # The first pass uses the deterministic center clip; if doing multi-clip TTA,
         # subsequent passes each sample a different random temporal window.
@@ -369,16 +381,10 @@ def run_eval(args, model, device, val_ts_transforms):  # pylint: disable=too-man
     print(f'Test loss: {test_loss:.6f}, test accuracy: {100 * accuracy:.4f}% '
           f'(tta_clips={n_clips}).')
 
-    if not args.no_wandb:
-        # A separate, dedicated eval run: --mode eval is typically a distinct process/invocation
-        # from training (e.g. run after training finishes, possibly much later, sometimes on a
-        # different checkpoint), so it gets its own wandb run rather than trying to resume the
-        # training run's session across processes. This is what actually gives you "evidence of
-        # performance on weights and biases for loss/accuracy for train/test/val" -- train/val
-        # were already logged during training; this is the test half.
-        eval_run_name = f'{args.run_name}-eval' if args.run_name else None
-        wandb.init(project=args.wandb_project, name=eval_run_name, config=vars(args),
-                   job_type='eval')
+    if use_wandb:
+        # This is what actually gives you "evidence of performance on weights and biases for
+        # loss/accuracy for train/test/val" -- train/val were already logged during training;
+        # this is the test half.
         wandb.log({'test_loss': test_loss, 'test_accuracy': accuracy, 'tta_clips': n_clips})
         wandb.finish()
 
