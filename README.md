@@ -1,6 +1,6 @@
 # HMDB51 Video Classification
 
-This repository was originally a working-but-flawed video classification pipeline (LRCN: ResNet + LSTM, trained on HMDB51). The assignment brief was explicit that the codebase contained **a data leak** and **a critically significant bug**. This README documents what was found and fixed, the model-level improvements made on top of the corrected base, and how to run the
+This repository was originally a working-but-flawed video classification pipeline (LRCN: ResNet + LSTM, trained on HMDB51). It was explicitly given such that the codebase contained **a data leak** and **a critically significant bug**. This README documents what was found and fixed, the model-level improvements made on top of the corrected base, and how to run the
 project.
 
 
@@ -118,7 +118,7 @@ share a source video, letting clips of the same video end up split across train 
    the current design, verified with an adversarial stress test.
 
 ### Other bugs found and fixed
-(some were suggested by LLM, as I was stuck and needed help finding the bugs affecting training when I was stuck at 40% for accuracy.)
+(some were suggested by LLM, as I was stuck and needed help finding the bugs affecting training when I was stuck at 40% for accuracy; these were added over time, after multiple runs of debugging)
 
 | Bug | File | Description |
 |---|---|---|
@@ -286,7 +286,7 @@ train/val history. `--tta_clips` controls multi-clip test-time averaging, which 
 
 # Conclusion
 
-I did not achieve 85% test accuracy. I achieved 78.81 I was off by 6 ish points when I tested it. There could be some hyperparameters that I did not tune well, but I think this is the best performance I reached with these hyperparameters set in training script. Furthermore, throughout my code, I have remnants of classes and functions for different architectures I tested but did not end up choosing for evaluation. The ones listed here for X3D were used during training, as I found that it aimts to determine how many parameters to use for efficient video recognition. In one of the papers for Module 7, it was mentioned that X3D iteratively expands 6 dimensions to find the optimal tradeoff to make the model larger with the best tradeoff; it trains with 30 tiny models that require less multiply add operations than training one large networks; this beats my previous architecture's accuracy, but gains are slow. This is seen as I experimented with the code, I needed more training for convergence, but even with more training, gains are very slow and only kick in after many epoch steps after a few decay steps.
+I did not achieve 85% test accuracy. I achieved 78.81 I was off by 6 ish points when I tested it. There could be some hyperparameters that I did not tune well, but I think this is the best performance I reached with these hyperparameters set in training script. Furthermore, throughout my code, I have remnants of classes and functions for different architectures I tested but did not end up choosing for evaluation. The ones listed here for X3D were used during training, as I found that it aimts to determine how many parameters to use for efficient video recognition. Random temporal subsampling also helped these gains, since sampling a different window of frames each epoch instead of the same fixed frames every time meant the model saw more of each video's temporal variation over the course of training, rather than memorizing one fixed snapshot of it. In one of the papers for Module 7, it was mentioned that X3D iteratively expands 6 dimensions to find the optimal tradeoff to make the model larger with the best tradeoff; it trains with 30 tiny models that require less multiply add operations than training one large networks; this beats my previous architecture's accuracy, but gains are slow. This is seen as I experimented with the code, I needed more training for convergence, but even with more training, gains are very slow and only kick in after many epoch steps after a few decay steps.
 
 ** Note: I have remnants of code from several different model architectures we discussed in class; they are not called during training or eval, they are just there in the repo, because I didn't want to risk deleting code that is currently working in case something breaks. This is why in some of my customization, I try to explain my code and why I chose certain hyperparameters to tune for this project.
 
